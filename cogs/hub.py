@@ -1,0 +1,482 @@
+"""
+cogs/hub.py — 統合コマンドチャンネル（v2.1）
+
+SOSチャンネルを「しんちょくんコマンドチャンネル」に統合し、
+SOS・ミーティング・クエスト状況・マイルストーン・ピアボーナス・ランキングの
+全機能を1チャンネルの常設ボタンから利用可能にする。
+"""
+
+import logging
+from datetime import datetime, timedelta, timezone
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+
+import config
+from rate_limiter import dm_limiter
+from gamification import ExpManager, TitleSystem
+
+logger = logging.getLogger(__name__)
+JST = timezone(timedelta(hours=9))
+
+
+# ============================================
+# SOS機能（sos.pyから移植）
+# ============================================
+
+class SOSModal(discord.ui.Modal, title="🆘 SOSフォーム"):
+    content = discord.ui.TextInput(
+        label="困っていること",
+        placeholder="例: UV展開がうまくいかない、テクスチャの参考がほしい",
+        style=discord.TextStyle.paragraph, required=True, max_length=1000,
+    )
+    urgency_input = discord.ui.TextInput(
+        label="緊急度（低 / 中 / 高）",
+        placeholder="低・中・高 のいずれかを入力",
+        style=discord.TextStyle.short, required=True, max_length=2, default="中",
+    )
+
+    def __init__(self, bot: commands.Bot, mentor_id: int):
+        super().__init__()
+        self.bot = bot
+        self.mentor_id = mentor_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user = interaction.user
+        content_text = self.content.value
+        urgency = self.urgency_input.value
+
+        # メンバー別感謝メッセージ
+        thanks_msg = "💙 **報告ありがとう！**🙏"
+        if self.bot.sheets:
+            custom = self.bot.sheets.get_message(user.id, "sos_thanks")
+            if custom:
+                thanks_msg = f"💙 **{custom}**"
+
+        await interaction.response.send_message(thanks_msg, ephemeral=True)
+
+        urgency_map = {"低": "low", "中": "medium", "高": "high"}
+        urgency_key = urgency_map.get(urgency, "medium")
+        urgency_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(urgency_key, "🟡")
+
+        # メンターにDM
+        try:
+            mentor = await self.bot.fetch_user(self.mentor_id)
+            if mentor:
+                embed = discord.Embed(
+                    title="📩 SOSメッセージが届きました",
+                    description=f"**{user.display_name}** さんから相談です。",
+                    color=config.COLOR_SOS,
+                )
+                embed.add_field(name="📝 困りごと", value=content_text, inline=False)
+                embed.add_field(name=f"{urgency_emoji} 緊急度", value=urgency, inline=True)
+                embed.set_thumbnail(url=user.display_avatar.url)
+                embed.set_footer(text="しんちょくん 🤖 | SOS通知")
+                async with dm_limiter:
+                    await mentor.send(embed=embed)
+        except Exception as e:
+            logger.error(f"❌ メンターDM送信エラー: {e}")
+
+        # リーダーにCc
+        leader_info = self.bot.sheets.get_leader() if self.bot.sheets else None
+        leader_id = leader_info["discord_id"] if leader_info else config.LEADER_ID
+        if leader_id and leader_id != self.mentor_id:
+            try:
+                leader = await self.bot.fetch_user(leader_id)
+                if leader:
+                    cc_embed = discord.Embed(
+                        title="📋 SOS通知（Cc）",
+                        description=f"**{user.display_name}** さんがメンターに相談しました。",
+                        color=config.COLOR_WARNING,
+                    )
+                    cc_embed.add_field(name="📝 困りごと", value=content_text, inline=False)
+                    cc_embed.add_field(name=f"{urgency_emoji} 緊急度", value=urgency, inline=True)
+                    cc_embed.set_footer(text="しんちょくん 🤖 | Cc通知")
+                    async with dm_limiter:
+                        await leader.send(embed=cc_embed)
+            except Exception as e:
+                logger.error(f"❌ リーダーCc送信エラー: {e}")
+
+        # EXP +5
+        try:
+            guild = self.bot.get_guild(config.GUILD_ID) if config.GUILD_ID else None
+            exp_manager = ExpManager(self.bot.db, self.bot.sheets)
+            await exp_manager.grant_exp(user.id, config.EXP_REWARDS["sos_send"], "SOS送信ボーナス", guild=guild)
+        except Exception as e:
+            logger.error(f"❌ SOS EXP付与エラー: {e}")
+
+        # DB記録
+        try:
+            await self.bot.db.save_sos_request(user.id, self.mentor_id, content_text, urgency_key)
+        except Exception as e:
+            logger.error(f"❌ SOS記録エラー: {e}")
+
+
+class MentorSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, sender_id: int):
+        super().__init__(timeout=120)
+        self.bot = bot
+        options = []
+        for uid in config.get_active_member_ids():
+            if uid == sender_id:
+                continue
+            user = self.bot.get_user(uid)
+            name = user.display_name if user else f"ID:{uid}"
+            options.append(discord.SelectOption(label=name, value=str(uid)))
+        if not options:
+            options.append(discord.SelectOption(label="メンバー未設定", value="0"))
+        select = discord.ui.Select(placeholder="相談したいメンバーを選択...", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        mentor_id = int(interaction.data["values"][0])
+        if mentor_id == 0:
+            await interaction.response.send_message("⚠️ メンバーが設定されていません。", ephemeral=True)
+            return
+        modal = SOSModal(self.bot, mentor_id)
+        await interaction.response.send_modal(modal)
+
+
+# ============================================
+# ミーティング機能（複数人対応・フォーム化）
+# ============================================
+
+class MeetingModal(discord.ui.Modal, title="📅 ミーティング調整"):
+    datetime_input = discord.ui.TextInput(
+        label="日時", placeholder="例: 5/1（木）14:00",
+        style=discord.TextStyle.short, required=True, max_length=100,
+    )
+    subject_input = discord.ui.TextInput(
+        label="内容", placeholder="例: キャラモデルのレビュー",
+        style=discord.TextStyle.short, required=True, max_length=200,
+    )
+
+    def __init__(self, bot: commands.Bot, target_ids: list[int]):
+        super().__init__()
+        self.bot = bot
+        self.target_ids = target_ids
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        dt = self.datetime_input.value
+        subject = self.subject_input.value
+        sent = 0
+
+        for uid in self.target_ids:
+            meeting_id = await self.bot.db.save_meeting_request(
+                interaction.user.id, uid, dt, subject
+            )
+            try:
+                user = await self.bot.fetch_user(uid)
+                if user:
+                    embed = discord.Embed(
+                        title="📅 打ち合わせの打診",
+                        description=f"**{interaction.user.display_name}** さんから提案があります。",
+                        color=config.COLOR_PRIMARY,
+                    )
+                    embed.add_field(name="📆 日時", value=dt, inline=True)
+                    embed.add_field(name="📝 内容", value=subject, inline=True)
+                    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                    embed.set_footer(text="しんちょくん 🤖 | 日程調整")
+
+                    from cogs.meeting import MeetingResponseView
+                    view = MeetingResponseView(self.bot, meeting_id, interaction.user.id)
+                    async with dm_limiter:
+                        await user.send(embed=embed, view=view)
+                    sent += 1
+            except Exception as e:
+                logger.error(f"❌ ミーティングDM送信エラー ({uid}): {e}")
+
+        await interaction.followup.send(f"✅ {sent}人にミーティング打診を送信しました！\n📆 {dt} | 📝 {subject}", ephemeral=True)
+
+
+class MeetingMemberSelect(discord.ui.View):
+    def __init__(self, bot: commands.Bot, sender_id: int):
+        super().__init__(timeout=120)
+        self.bot = bot
+        options = []
+        for uid in config.get_active_member_ids():
+            if uid == sender_id:
+                continue
+            user = self.bot.get_user(uid)
+            name = user.display_name if user else f"ID:{uid}"
+            options.append(discord.SelectOption(label=name, value=str(uid)))
+        if not options:
+            options.append(discord.SelectOption(label="メンバー未設定", value="0"))
+        select = discord.ui.Select(
+            placeholder="参加者を選択（複数可）...", options=options,
+            min_values=1, max_values=max(1, len(options)),
+        )
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        selected = [int(v) for v in interaction.data["values"]]
+        if 0 in selected:
+            await interaction.response.send_message("⚠️ メンバーが設定されていません。", ephemeral=True)
+            return
+        modal = MeetingModal(self.bot, selected)
+        await interaction.response.send_modal(modal)
+
+
+# ============================================
+# ピアボーナス機能
+# ============================================
+
+class PeerBonusModal(discord.ui.Modal, title="🎁 ピアボーナス"):
+    message_input = discord.ui.TextInput(
+        label="感謝のメッセージ",
+        placeholder="例: UV展開手伝ってくれてありがとう！",
+        style=discord.TextStyle.paragraph, required=True, max_length=500,
+    )
+
+    def __init__(self, bot: commands.Bot, target_id: int):
+        super().__init__()
+        self.bot = bot
+        self.target_id = target_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        sender = interaction.user
+        msg_text = self.message_input.value
+
+        # 1日上限チェック
+        today_count = await self.bot.db.get_today_bonus_count(sender.id)
+        if today_count >= config.PEER_BONUS_DAILY_LIMIT:
+            await interaction.followup.send(
+                f"⚠️ 今日の送信上限（{config.PEER_BONUS_DAILY_LIMIT}回）に達しています。また明日！",
+                ephemeral=True,
+            )
+            return
+
+        # DB記録
+        await self.bot.db.save_peer_bonus(sender.id, self.target_id, msg_text)
+
+        # EXP付与（双方）
+        guild = self.bot.get_guild(config.GUILD_ID) if config.GUILD_ID else None
+        exp_manager = ExpManager(self.bot.db, self.bot.sheets)
+        await exp_manager.grant_exp(sender.id, config.EXP_REWARDS["peer_bonus_send"], "ピアボーナス送信", guild=guild)
+        await exp_manager.grant_exp(self.target_id, config.EXP_REWARDS["peer_bonus_receive"], "ピアボーナス受信", guild=guild)
+
+        # 相手にDM
+        try:
+            target_user = await self.bot.fetch_user(self.target_id)
+            if target_user:
+                bonus_msg = "感謝のメッセージが届きました 💌"
+                if self.bot.sheets:
+                    custom = self.bot.sheets.get_message(self.target_id, "peer_bonus")
+                    if custom:
+                        bonus_msg = custom
+
+                nickname = ""
+                if self.bot.sheets:
+                    nickname = self.bot.sheets.get_member_nickname(sender.id)
+                sender_name = nickname or sender.display_name
+
+                embed = discord.Embed(
+                    title=f"🎁 {bonus_msg}",
+                    description=f"**{sender_name}** さんからの感謝です。",
+                    color=config.COLOR_PEER,
+                )
+                embed.add_field(name="💬 メッセージ", value=msg_text, inline=False)
+                embed.add_field(name="⭐ ボーナス", value=f"+{config.EXP_REWARDS['peer_bonus_receive']} EXP", inline=True)
+                embed.set_thumbnail(url=sender.display_avatar.url)
+                embed.set_footer(text="しんちょくん 🤖 | ピアボーナス")
+                async with dm_limiter:
+                    await target_user.send(embed=embed)
+        except Exception as e:
+            logger.error(f"❌ ピアボーナスDM送信エラー: {e}")
+
+        remaining = config.PEER_BONUS_DAILY_LIMIT - today_count - 1
+        await interaction.followup.send(
+            f"🎁 感謝を送信しました！ 双方に **+{config.EXP_REWARDS['peer_bonus_send']} EXP** 💌\n"
+            f"今日の残り送信回数: {remaining}回",
+            ephemeral=True,
+        )
+
+
+class PeerBonusSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, sender_id: int):
+        super().__init__(timeout=120)
+        self.bot = bot
+        options = []
+        for uid in config.get_active_member_ids():
+            if uid == sender_id:
+                continue
+            user = self.bot.get_user(uid)
+            name = user.display_name if user else f"ID:{uid}"
+            options.append(discord.SelectOption(label=name, value=str(uid)))
+        if not options:
+            options.append(discord.SelectOption(label="メンバー未設定", value="0"))
+        select = discord.ui.Select(placeholder="感謝を送る相手を選択...", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        target_id = int(interaction.data["values"][0])
+        if target_id == 0:
+            await interaction.response.send_message("⚠️ メンバーが設定されていません。", ephemeral=True)
+            return
+        modal = PeerBonusModal(self.bot, target_id)
+        await interaction.response.send_modal(modal)
+
+
+# ============================================
+# 統合コマンドチャンネル常設View（永続）
+# ============================================
+
+class PersistentHubView(discord.ui.View):
+    """全機能を集約した永続ボタンView"""
+
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(label="🆘 SOS", style=discord.ButtonStyle.danger, custom_id="hub_sos_btn", row=0)
+    async def sos_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = MentorSelectView(self.bot, interaction.user.id)
+        await interaction.response.send_message(
+            "🧑‍🏫 **相談したいメンバーを選んでください**", view=view, ephemeral=True
+        )
+
+    @discord.ui.button(label="📅 ミーティング", style=discord.ButtonStyle.primary, custom_id="hub_meeting_btn", row=0)
+    async def meeting_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = MeetingMemberSelect(self.bot, interaction.user.id)
+        await interaction.response.send_message(
+            "📅 **参加者を選んでください（複数選択可）**", view=view, ephemeral=True
+        )
+
+    @discord.ui.button(label="⚔️ クエスト状況", style=discord.ButtonStyle.secondary, custom_id="hub_quest_btn", row=1)
+    async def quest_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        user_id = interaction.user.id
+
+        exp_manager = ExpManager(self.bot.db, getattr(self.bot, "sheets", None))
+        profile = await exp_manager.ensure_profile(user_id)
+
+        embed = discord.Embed(title=f"⚔️ {interaction.user.display_name} のクエスト状況", color=config.COLOR_QUEST)
+        embed.add_field(name="🏅 称号", value=profile["current_title"] or "未設定", inline=True)
+        embed.add_field(name="📊 レベル", value=f"Lv.{profile['level']}", inline=True)
+        embed.add_field(name="💰 累計EXP", value=f"{profile['total_exp']} EXP", inline=True)
+
+        # プログレスバー
+        next_exp = TitleSystem.get_exp_for_next_level(profile["level"])
+        current_level_exp = profile["level"] ** 2 * config.EXP_PER_LEVEL_UNIT
+        progress = profile["total_exp"] - current_level_exp
+        needed = next_exp - current_level_exp
+        filled = min(10, int(progress / needed * 10)) if needed > 0 else 10
+        bar = "▓" * filled + "░" * (10 - filled)
+        remaining = max(0, next_exp - profile["total_exp"])
+        embed.add_field(name="📈 次のレベルまで", value=f"[{bar}] 残り **{remaining} EXP**", inline=False)
+
+        # 今週のクエスト
+        if self.bot.sheets:
+            try:
+                week_start = self.bot.sheets.get_current_week_start()
+                quests = await self.bot.sheets.get_weekly_quests(week_start)
+                user_quests = [q for q in quests if q["discord_id"] == user_id]
+                completions = await self.bot.db.get_quest_completions(user_id, week_start)
+                completed_titles = {c["quest_title"] for c in completions}
+                if user_quests:
+                    lines = [f"{'✅' if q['quest_title'] in completed_titles else '⬜'} {q['quest_title']}" for q in user_quests]
+                    embed.add_field(
+                        name=f"📋 今週のクエスト ({len(completed_titles)}/{len(user_quests)})",
+                        value="\n".join(lines), inline=False,
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ クエスト情報取得エラー: {e}")
+
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(text="しんちょくん 🤖")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🎯 マイルストーン", style=discord.ButtonStyle.secondary, custom_id="hub_milestone_btn", row=1)
+    async def milestone_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        today = datetime.now(JST).date()
+        embed = discord.Embed(title="🎯 プロジェクトマイルストーン", color=config.COLOR_PRIMARY)
+        for ms in config.MILESTONES:
+            deadline = datetime.strptime(ms["deadline"], "%Y-%m-%d").date()
+            days = (deadline - today).days
+            if days < 0:
+                status = f"✅ 完了期限超過 ({abs(days)}日超過)"
+            elif days == 0:
+                status = "🔥 今日が期限！"
+            elif days <= 7:
+                status = f"⚠️ 残り **{days}日**"
+            else:
+                status = f"🕐 残り **{days}日**"
+            embed.add_field(name=f"{ms['name']}（{ms['deadline']}）", value=f"{status}\n{ms['description']}", inline=False)
+        embed.set_footer(text="しんちょくん 🤖")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🎁 ピアボーナス", style=discord.ButtonStyle.success, custom_id="hub_peer_btn", row=2)
+    async def peer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = PeerBonusSelectView(self.bot, interaction.user.id)
+        await interaction.response.send_message(
+            "🎁 **感謝を送る相手を選んでください**", view=view, ephemeral=True
+        )
+
+    @discord.ui.button(label="🏆 ランキング", style=discord.ButtonStyle.secondary, custom_id="hub_ranking_btn", row=2)
+    async def ranking_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        profiles = await self.bot.db.get_all_user_profiles()
+        if not profiles:
+            await interaction.followup.send("📊 ランキングデータがまだありません。", ephemeral=True)
+            return
+        embed = discord.Embed(title="🏆 EXPランキング", color=config.COLOR_GOLD)
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        for i, p in enumerate(profiles):
+            user = self.bot.get_user(p["discord_id"])
+            name = user.display_name if user else f"ID:{p['discord_id']}"
+            medal = medals[i] if i < len(medals) else f"{i+1}."
+            embed.add_field(
+                name=f"{medal} {name}",
+                value=f"🏅 {p['current_title']}\n📊 Lv.{p['level']} | 💰 {p['total_exp']} EXP",
+                inline=False,
+            )
+        embed.set_footer(text="しんちょくん 🤖 | ランキング")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ============================================
+# Hub Cog
+# ============================================
+
+class HubCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="setup_hub", description="コマンドチャンネルに常設フォームを設置します")
+    @app_commands.default_permissions(administrator=True)
+    async def setup_hub(self, interaction: discord.Interaction):
+        channel = self.bot.get_channel(config.SOS_CHANNEL_ID)
+        if not channel:
+            await interaction.response.send_message("⚠️ チャンネルが見つかりません。`.env` の `SOS_CHANNEL_ID` を確認してください。", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🤖 しんちょくん コマンドセンター",
+            description=(
+                "以下のボタンから各機能を利用できます。\n"
+                "ボタンを押すと**あなただけに見える**メッセージで応答します。\n\n"
+                "🆘 **SOS** — 困ったときにメンターに相談\n"
+                "📅 **ミーティング** — 打ち合わせの調整（複数人OK）\n"
+                "⚔️ **クエスト状況** — 自分のクエスト・EXP確認\n"
+                "🎯 **マイルストーン** — プロジェクト締切確認\n"
+                "🎁 **ピアボーナス** — メンバーに感謝を送る\n"
+                "🏆 **ランキング** — チームのEXPランキング"
+            ),
+            color=config.COLOR_PRIMARY,
+        )
+        embed.set_footer(text="しんちょくん 🤖 | コマンドセンター")
+
+        view = PersistentHubView(self.bot)
+        await channel.send(embed=embed, view=view)
+        await interaction.response.send_message("✅ コマンドセンターを設置しました！", ephemeral=True)
+        logger.info("✅ ハブ常設フォーム設置完了")
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(HubCog(bot))
