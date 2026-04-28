@@ -17,7 +17,6 @@ from datetime import timedelta
 
 import discord
 from discord.ext import commands
-from discord import app_commands
 
 import config
 from database import now_jst
@@ -183,16 +182,6 @@ class SummaryCog(commands.Cog):
         # 全Embedを送信
         await channel.send(embeds=embeds)
         logger.info(f"📊 週間サマリーを投稿しました ({week_start} 〜 {week_end})")
-
-    # テスト用コマンド
-    @app_commands.command(
-        name="test_summary",
-        description="【テスト用】週次サマリーを手動で投稿します",
-    )
-    async def test_summary(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        await self.post_weekly_summary()
-        await interaction.followup.send("✅ 週次サマリーを投稿しました！", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
