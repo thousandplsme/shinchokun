@@ -84,6 +84,10 @@ class TitleSystem:
         # TITLE_TEMPLATES のキー（必要レベル）を降順ソート
         sorted_levels = sorted(config.TITLE_TEMPLATES.keys(), reverse=True)
 
+        # job_name が空の場合のフォールバック
+        if not job_name or not job_name.strip():
+            job_name = "クリエイター"  # 職種未設定時のデフォルト
+
         for required_level in sorted_levels:
             if level >= required_level:
                 template = config.TITLE_TEMPLATES[required_level]
@@ -162,6 +166,7 @@ class ExpManager:
                     job_name = self.sheets.get_job_name(job_type)
 
             title = TitleSystem.get_title(1, job_name or job_type)
+            logger.info(f"📝 プロフィール初回作成: ID={discord_id}, job_type={job_type}, job_name={job_name}, title={title}")
             await self.db.upsert_user_profile(
                 discord_id=discord_id,
                 total_exp=0,

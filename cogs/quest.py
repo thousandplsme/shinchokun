@@ -315,10 +315,23 @@ class QuestCog(commands.Cog):
         logger.info("📜 週次クエスト配信を開始...")
 
         sheets = self.bot.sheets
-        week_start = sheets.get_current_week_start()
+        if sheets is None:
+            logger.error("❌ Google Sheets 未接続のためクエスト配信をスキップします。")
+            return
+
+        try:
+            week_start = sheets.get_current_week_start()
+        except Exception as e:
+            logger.error(f"❌ 週開始日の取得に失敗: {e}")
+            return
 
         # Google Sheets からデータ取得
-        quests = await sheets.get_weekly_quests(week_start)
+        try:
+            quests = await sheets.get_weekly_quests(week_start)
+        except Exception as e:
+            logger.error(f"❌ クエストデータの取得に失敗: {e}")
+            return
+
         if not quests:
             logger.info(f"⚠️ {week_start} のクエストが見つかりません。配信をスキップ。")
             return

@@ -33,8 +33,12 @@ class CommandsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         quest_cog = self.bot.get_cog("QuestCog")
         if quest_cog:
-            await quest_cog.deliver_weekly_quests()
-            await interaction.followup.send("✅ クエスト配信を実行しました！", ephemeral=True)
+            try:
+                await quest_cog.deliver_weekly_quests()
+                await interaction.followup.send("✅ クエスト配信を実行しました！", ephemeral=True)
+            except Exception as e:
+                logger.error(f"❌ test_quest エラー: {e}")
+                await interaction.followup.send(f"❌ クエスト配信中にエラーが発生しました:\n```{e}```", ephemeral=True)
         else:
             await interaction.followup.send("⚠️ QuestCogが読み込まれていません。", ephemeral=True)
 
