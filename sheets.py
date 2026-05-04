@@ -40,6 +40,22 @@ SCOPES = [
 ]
 
 
+def _normalize_records(records: list[dict]) -> list[dict]:
+    """
+    get_all_records() の結果のキー名を正規化する。
+    
+    Google Sheets でプルダウンやデータ検証を使うと、
+    ヘッダー行に余分なスペースが入ることがある。
+    前後のスペースを除去して安全にアクセスできるようにする。
+    """
+    normalized = []
+    for record in records:
+        normalized.append({
+            str(k).strip(): v for k, v in record.items()
+        })
+    return normalized
+
+
 class SheetsClient:
     """
     Google Sheets API の操作を一元管理するクラス。
@@ -138,10 +154,15 @@ class SheetsClient:
             return worksheet.get_all_records()
 
         records = await asyncio.to_thread(_read)
+        records = _normalize_records(records)
 
         # discord_id を int に変換（スプレッドシートでは文字列になる場合がある）
         for r in records:
-            r["discord_id"] = int(r["discord_id"])
+            try:
+                r["discord_id"] = int(r.get("discord_id", 0))
+            except (ValueError, TypeError):
+                logger.warning(f"⚠️ discord_id の変換失敗: {r}")
+                r["discord_id"] = 0
         return records
 
     def get_members(self) -> list[dict]:
@@ -215,13 +236,24 @@ class SheetsClient:
             return worksheet.get_all_records()
 
         records = await asyncio.to_thread(_read)
+        records = _normalize_records(records)
+
+        if records:
+            logger.debug(f"📊 週次タスクシートのキー: {list(records[0].keys())}")
 
         # 指定週のタスクのみフィルタリング
         quests = []
         for r in records:
-            if str(r.get("week_start", "")) == week_start:
-                r["discord_id"] = int(r["discord_id"])
-                r["exp_reward"] = int(r.get("exp_reward", 10))
+            if str(r.get("week_start", "")).strip() == week_start:
+                try:
+                    r["discord_id"] = int(r.get("discord_id", 0))
+                except (ValueError, TypeError):
+                    logger.warning(f"⚠️ discord_id の変換失敗 (スキップ): {r}")
+                    continue
+                try:
+                    r["exp_reward"] = int(r.get("exp_reward", 10))
+                except (ValueError, TypeError):
+                    r["exp_reward"] = 10
                 quests.append(r)
         return quests
 
@@ -312,6 +344,7 @@ class SheetsClient:
                 return []
 
         records = await asyncio.to_thread(_read)
+        records = _normalize_records(records)
         result = []
         for r in records:
             try:

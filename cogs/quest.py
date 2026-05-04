@@ -323,6 +323,7 @@ class QuestCog(commands.Cog):
             week_start = sheets.get_current_week_start()
         except Exception as e:
             logger.error(f"❌ 週開始日の取得に失敗: {e}")
+            await self.bot.notify_leader_error("クエスト配信: 週開始日取得", e)
             return
 
         # Google Sheets からデータ取得
@@ -330,6 +331,7 @@ class QuestCog(commands.Cog):
             quests = await sheets.get_weekly_quests(week_start)
         except Exception as e:
             logger.error(f"❌ クエストデータの取得に失敗: {e}")
+            await self.bot.notify_leader_error("クエスト配信: データ取得", e)
             return
 
         if not quests:

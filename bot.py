@@ -187,8 +187,41 @@ class ShinchokuBot(commands.Bot):
                 logger.info("⚡ 週次サマリー漏れ検知！ 自動投稿します")
                 await summary_cog.post_weekly_summary()
 
+    async def notify_leader_error(self, context: str, error: Exception):
+        """
+        エラー発生時にリーダーのDMに詳細を通知する。
+
+        Args:
+            context: エラー発生箇所の説明（例: "クエスト配信"）
+            error: 発生した例外
+        """
+        try:
+            if self.sheets:
+                leader = self.sheets.get_leader()
+                if leader:
+                    leader_user = await self.fetch_user(leader["discord_id"])
+                    if leader_user:
+                        embed = discord.Embed(
+                            title="⚠️ しんちょくん エラー通知",
+                            description=f"**{context}** でエラーが発生しました。",
+                            color=config.COLOR_DANGER,
+                        )
+                        error_text = str(error)[:1000]  # 長すぎる場合は切り詰め
+                        embed.add_field(name="📋 エラー詳細", value=f"```{error_text}```", inline=False)
+                        embed.add_field(
+                            name="💡 対処方法",
+                            value="bot.log を確認してください。\n自動復旧できない場合はBot再起動をお試しください。",
+                            inline=False,
+                        )
+                        embed.set_footer(text="しんちょくん 🤖 | エラー通知")
+                        await leader_user.send(embed=embed)
+                        logger.info(f"📨 リーダーにエラー通知を送信: {context}")
+        except Exception as notify_err:
+            logger.warning(f"⚠️ リーダーへのエラー通知に失敗: {notify_err}")
+
     async def on_command_error(self, ctx, error):
         logger.error(f"コマンドエラー: {error}")
+        await self.notify_leader_error(f"コマンド: {ctx.command}", error)
 
 
 def main():

@@ -67,7 +67,33 @@ class CommandsCog(commands.Cog):
         # 1. EXPログ全件取得
         logs = await self.bot.sheets.get_all_exp_logs()
         if not logs:
-            await interaction.followup.send("⚠️ EXPログが空です。", ephemeral=True)
+            # EXPログが空 → 全メンバーのEXPをリセット
+            member_ids = config.get_active_member_ids()
+            reset_count = 0
+            for uid in member_ids:
+                profile = await self.bot.db.get_user_profile(uid)
+                if profile and profile["total_exp"] > 0:
+                    job_type = profile.get("job_type", "")
+                    if not job_type and self.bot.sheets:
+                        member = self.bot.sheets.get_member(uid)
+                        if member:
+                            job_type = member.get("job_type", "")
+                    job_name = self.bot.sheets.get_job_name(job_type) if self.bot.sheets else job_type
+                    new_title = TitleSystem.get_title(1, job_name)
+                    await self.bot.db.upsert_user_profile(
+                        discord_id=uid, total_exp=0, level=1,
+                        job_type=job_type, current_title=new_title,
+                        consecutive_weeks=0,
+                    )
+                    reset_count += 1
+            embed = discord.Embed(
+                title="🔄 EXPリセット完了",
+                description=f"EXPログが空のため、**{reset_count}人** のEXPを0にリセットしました。",
+                color=config.COLOR_WARNING,
+            )
+            embed.set_footer(text="しんちょくん 🤖 | EXP同期")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"🔄 EXPログ空 → {reset_count}人リセット")
             return
 
         # 2. ユーザーごとに合算
@@ -133,12 +159,29 @@ class CommandsCog(commands.Cog):
 
         for uid in member_ids:
             try:
-                # ensure_profile で初回ならロールも作成
+                # ensure_profile で初回ならDB作成
                 profile = await exp_manager.ensure_profile(uid, guild=guild)
-                title = profile["current_title"]
                 level = profile["level"]
 
-                if not title:
+                # 称号を常に再計算（DB上の壊れたタイトルを修復）
+                job_type = profile.get("job_type", "")
+                if not job_type and self.bot.sheets:
+                    member_info = self.bot.sheets.get_member(uid)
+                    if member_info:
+                        job_type = member_info.get("job_type", "")
+                job_name = self.bot.sheets.get_job_name(job_type) if self.bot.sheets else job_type
+                title = TitleSystem.get_title(level, job_name)
+
+                # DB上のタイトルが壊れていたら修復
+                if title != profile["current_title"]:
+                    logger.info(f"🔧 称号修復: ID={uid}, '{profile['current_title']}' → '{title}'")
+                    await self.bot.db.upsert_user_profile(
+                        discord_id=uid, total_exp=profile["total_exp"], level=level,
+                        job_type=job_type, current_title=title,
+                        consecutive_weeks=profile.get("consecutive_weeks", 0),
+                    )
+
+                if not title or not title.strip():
                     continue
 
                 # ロールの存在確認＆付与
