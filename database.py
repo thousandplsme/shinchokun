@@ -137,6 +137,45 @@ CREATE TABLE IF NOT EXISTS peer_bonuses (
     message TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- ===== v2.2 新規テーブル =====
+
+-- 日程調整投票（「調整さん」方式）
+CREATE TABLE IF NOT EXISTS schedule_polls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_by INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    candidates TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    confirmed_slot TEXT DEFAULT '',
+    event_id INTEGER DEFAULT 0,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- 各メンバーの投票記録
+CREATE TABLE IF NOT EXISTS schedule_votes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    poll_id INTEGER NOT NULL,
+    discord_id INTEGER NOT NULL,
+    selected_slots TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(poll_id, discord_id)
+);
+
+-- タスク追加申請
+CREATE TABLE IF NOT EXISTS task_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    discord_id INTEGER NOT NULL,
+    quest_title TEXT NOT NULL,
+    quest_detail TEXT DEFAULT '',
+    requested_exp INTEGER DEFAULT 30,
+    week_start TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    reviewer_id INTEGER DEFAULT 0,
+    reject_reason TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -606,3 +645,135 @@ class Database:
             ) as cursor:
                 result = await cursor.fetchone()
                 return result[0]
+
+    # ============================================
+    # 日程調整投票（v2.2 新規）
+    # ============================================
+
+    async def create_schedule_poll(
+        self, created_by: int, subject: str, candidates_json: str, expires_at: str
+    ) -> int:
+        """日程調整投票を作成し、IDを返す"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """INSERT INTO schedule_polls
+                   (created_by, subject, candidates, status, expires_at, created_at)
+                   VALUES (?, ?, ?, 'open', ?, ?)""",
+                (created_by, subject, candidates_json, expires_at, now_jst().isoformat()),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def save_schedule_vote(
+        self, poll_id: int, discord_id: int, selected_json: str
+    ) -> bool:
+        """投票を保存（UPSERT）。新規ならTrue"""
+        async with aiosqlite.connect(self.db_path) as db:
+            try:
+                await db.execute(
+                    """INSERT INTO schedule_votes (poll_id, discord_id, selected_slots, created_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(poll_id, discord_id) DO UPDATE SET
+                           selected_slots=excluded.selected_slots,
+                           created_at=excluded.created_at""",
+                    (poll_id, discord_id, selected_json, now_jst().isoformat()),
+                )
+                await db.commit()
+                return True
+            except Exception:
+                return False
+
+    async def get_schedule_poll(self, poll_id: int) -> dict | None:
+        """投票情報を取得する"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM schedule_polls WHERE id = ?", (poll_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_schedule_votes(self, poll_id: int) -> list[dict]:
+        """指定投票の全回答を取得する"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM schedule_votes WHERE poll_id = ? ORDER BY created_at",
+                (poll_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def get_schedule_vote_count(self, poll_id: int) -> int:
+        """指定投票の回答数を取得する"""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM schedule_votes WHERE poll_id = ?",
+                (poll_id,),
+            ) as cursor:
+                result = await cursor.fetchone()
+                return result[0]
+
+    async def confirm_schedule_poll(self, poll_id: int, confirmed_slot: str, event_id: int = 0):
+        """投票を確定状態にする"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """UPDATE schedule_polls SET status = 'confirmed',
+                   confirmed_slot = ?, event_id = ? WHERE id = ?""",
+                (confirmed_slot, event_id, poll_id),
+            )
+            await db.commit()
+
+    async def get_open_polls(self) -> list[dict]:
+        """期限切れの未確定投票を取得する（自動集計用）"""
+        now = now_jst().isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT * FROM schedule_polls
+                   WHERE status = 'open' AND expires_at <= ?""",
+                (now,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    # ============================================
+    # タスク申請操作（v2.2 新規）
+    # ============================================
+
+    async def create_task_request(
+        self, discord_id: int, quest_title: str, quest_detail: str,
+        requested_exp: int, week_start: str,
+    ) -> int:
+        """タスク申請を作成し、IDを返す"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """INSERT INTO task_requests
+                   (discord_id, quest_title, quest_detail, requested_exp, week_start, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+                (discord_id, quest_title, quest_detail, requested_exp, week_start, now_jst().isoformat()),
+            )
+            await db.commit()
+            return cursor.lastrowid
+
+    async def get_task_request(self, request_id: int) -> dict | None:
+        """タスク申請を取得する"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM task_requests WHERE id = ?", (request_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def update_task_request(
+        self, request_id: int, status: str, reviewer_id: int = 0, reject_reason: str = ""
+    ):
+        """タスク申請のステータスを更新する"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """UPDATE task_requests SET status = ?, reviewer_id = ?, reject_reason = ?
+                   WHERE id = ?""",
+                (status, reviewer_id, reject_reason, request_id),
+            )
+            await db.commit()

@@ -1,4 +1,4 @@
-"""
+﻿"""
 cogs/hub.py — 統合コマンドチャンネル（v2.1）
 
 SOSチャンネルを「しんちょくんコマンドチャンネル」に統合し、
@@ -324,11 +324,208 @@ class PeerBonusSelectView(discord.ui.View):
 
 
 # ============================================
-# 統合コマンドチャンネル常設View（永続）
+# タスク追加申請フォーム（v2.2）
+# ============================================
+
+class TaskRequestModal(discord.ui.Modal, title="📝 タスク追加申請"):
+    title_input = discord.ui.TextInput(
+        label="タスク名", placeholder="例: ステージBGMの作曲",
+        style=discord.TextStyle.short, required=True, max_length=100,
+    )
+    detail_input = discord.ui.TextInput(
+        label="詳細（任意）", placeholder="例: テンポ120前後、戦闘向け",
+        style=discord.TextStyle.paragraph, required=False, max_length=500,
+    )
+    exp_input = discord.ui.TextInput(
+        label="希望EXP量（空欄で30）", placeholder="30",
+        style=discord.TextStyle.short, required=False, max_length=5, default="30",
+    )
+
+    def __init__(self, bot: commands.Bot, week_start: str):
+        super().__init__()
+        self.bot = bot
+        self.week_start = week_start
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        title = self.title_input.value.strip()
+        detail = self.detail_input.value.strip()
+        try:
+            exp = int(self.exp_input.value.strip() or "30")
+        except ValueError:
+            exp = 30
+
+        req_id = await self.bot.db.create_task_request(
+            discord_id=interaction.user.id,
+            quest_title=title, quest_detail=detail,
+            requested_exp=exp, week_start=self.week_start,
+        )
+
+        leader_info = self.bot.sheets.get_leader() if self.bot.sheets else None
+        leader_id = leader_info["discord_id"] if leader_info else config.LEADER_ID
+        try:
+            leader = await self.bot.fetch_user(leader_id)
+            if leader:
+                embed = discord.Embed(
+                    title="📝 タスク追加申請",
+                    description=f"**{interaction.user.display_name}** さんからタスク申請があります。",
+                    color=config.COLOR_PRIMARY,
+                )
+                embed.add_field(name="📋 タスク名", value=title, inline=False)
+                if detail:
+                    embed.add_field(name="📝 詳細", value=detail, inline=False)
+                embed.add_field(name="⭐ 希望EXP", value=f"{exp} EXP", inline=True)
+                embed.add_field(name="📅 対象週", value=self.week_start, inline=True)
+                embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                embed.set_footer(text=f"しんちょくん 🤖 | 申請ID: {req_id}")
+                view = TaskApprovalView(self.bot, req_id)
+                async with dm_limiter:
+                    await leader.send(embed=embed, view=view)
+        except Exception as e:
+            logger.error(f"❌ タスク申請通知エラー: {e}")
+
+        await interaction.followup.send(
+            f"✅ タスク申請を送信しました！\n📋 {title} | ⭐ {exp} EXP | 📅 {self.week_start}",
+            ephemeral=True,
+        )
+
+
+class TaskApprovalView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, request_id: int):
+        super().__init__(timeout=86400 * 3)
+        self.bot = bot
+        self.request_id = request_id
+
+    @discord.ui.button(label="✅ 承認", style=discord.ButtonStyle.success)
+    async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        req = await self.bot.db.get_task_request(self.request_id)
+        if not req or req["status"] != "pending":
+            await interaction.followup.send("⚠️ この申請は処理済みです。", ephemeral=True)
+            return
+
+        await self.bot.db.update_task_request(self.request_id, "approved", interaction.user.id)
+
+        if self.bot.sheets:
+            try:
+                await self.bot.sheets.append_quest_row(
+                    req["week_start"], req["discord_id"],
+                    req["quest_title"], req["quest_detail"], req["requested_exp"],
+                )
+            except Exception as e:
+                logger.error(f"❌ Sheetsタスク追記エラー: {e}")
+
+        try:
+            user = await self.bot.fetch_user(req["discord_id"])
+            if user:
+                embed = discord.Embed(title="✅ タスク申請が承認されました！", color=config.COLOR_SUCCESS)
+                embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
+                embed.add_field(name="⭐ EXP", value=f"{req['requested_exp']} EXP", inline=True)
+                embed.set_footer(text="しんちょくん 🤖")
+                async with dm_limiter:
+                    await user.send(embed=embed)
+        except Exception as e:
+            logger.error(f"❌ 承認通知エラー: {e}")
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.edit_original_response(view=self)
+        await interaction.followup.send("✅ 承認しました！ Sheetsに追記済みです。", ephemeral=True)
+
+    @discord.ui.button(label="❌ 却下", style=discord.ButtonStyle.danger)
+    async def reject_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = TaskRejectModal(self.bot, self.request_id)
+        await interaction.response.send_modal(modal)
+
+
+class TaskRejectModal(discord.ui.Modal, title="❌ 却下理由"):
+    reason_input = discord.ui.TextInput(
+        label="却下理由", placeholder="例: EXP量を調整してください",
+        style=discord.TextStyle.paragraph, required=True, max_length=500,
+    )
+
+    def __init__(self, bot: commands.Bot, request_id: int):
+        super().__init__()
+        self.bot = bot
+        self.request_id = request_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        req = await self.bot.db.get_task_request(self.request_id)
+        if not req or req["status"] != "pending":
+            await interaction.followup.send("⚠️ この申請は処理済みです。", ephemeral=True)
+            return
+
+        reason = self.reason_input.value.strip()
+        await self.bot.db.update_task_request(self.request_id, "rejected", interaction.user.id, reason)
+
+        try:
+            user = await self.bot.fetch_user(req["discord_id"])
+            if user:
+                embed = discord.Embed(title="❌ タスク申請が却下されました", color=config.COLOR_DANGER)
+                embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
+                embed.add_field(name="💬 理由", value=reason, inline=False)
+                embed.set_footer(text="しんちょくん 🤖")
+                async with dm_limiter:
+                    await user.send(embed=embed)
+        except Exception as e:
+            logger.error(f"❌ 却下通知エラー: {e}")
+
+        await interaction.followup.send("✅ 却下しました。申請者に通知済みです。", ephemeral=True)
+
+
+# ============================================
+# ミーティングモード選択（v2.2）
+# ============================================
+
+class MeetingModeSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, sender_id: int):
+        super().__init__(timeout=60)
+        self.bot = bot
+        self.sender_id = sender_id
+
+    @discord.ui.button(label="📅 個別打診", style=discord.ButtonStyle.primary)
+    async def direct_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = MeetingMemberSelect(self.bot, self.sender_id)
+        await interaction.response.send_message(
+            "📅 **参加者を選んでください（複数選択可）**", view=view, ephemeral=True
+        )
+
+    @discord.ui.button(label="📊 日程調整", style=discord.ButtonStyle.success)
+    async def poll_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from cogs.scheduler import ScheduleCreateModal
+        modal = ScheduleCreateModal(self.bot)
+        await interaction.response.send_modal(modal)
+
+
+class TaskWeekSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=60)
+        self.bot = bot
+
+    @discord.ui.button(label="📅 今週", style=discord.ButtonStyle.primary)
+    async def this_week(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from sheets import SheetsClient
+        week = SheetsClient.get_current_week_start()
+        modal = TaskRequestModal(self.bot, week)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="📅 来週", style=discord.ButtonStyle.secondary)
+    async def next_week(self, interaction: discord.Interaction, button: discord.ui.Button):
+        today = datetime.now(JST).date()
+        monday = today - timedelta(days=today.weekday())
+        next_monday = monday + timedelta(days=7)
+        week = next_monday.strftime("%Y-%m-%d")
+        modal = TaskRequestModal(self.bot, week)
+        await interaction.response.send_modal(modal)
+
+
+# ============================================
+# 統合コマンドチャンネル常設View（永続）v2.2
 # ============================================
 
 class PersistentHubView(discord.ui.View):
-    """全機能を集約した永続ボタンView"""
+    """全機能を集約した永続ボタンView（v2.2）"""
 
     def __init__(self, bot: commands.Bot):
         super().__init__(timeout=None)
@@ -343,25 +540,22 @@ class PersistentHubView(discord.ui.View):
 
     @discord.ui.button(label="📅 ミーティング", style=discord.ButtonStyle.primary, custom_id="hub_meeting_btn", row=0)
     async def meeting_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = MeetingMemberSelect(self.bot, interaction.user.id)
+        view = MeetingModeSelectView(self.bot, interaction.user.id)
         await interaction.response.send_message(
-            "📅 **参加者を選んでください（複数選択可）**", view=view, ephemeral=True
+            "📅 **モードを選んでください**\n• **個別打診** — 相手を選んで日時を提案\n• **日程調整** — 全員に候補日時を投票してもらう",
+            view=view, ephemeral=True
         )
 
     @discord.ui.button(label="⚔️ クエスト状況", style=discord.ButtonStyle.secondary, custom_id="hub_quest_btn", row=1)
     async def quest_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
         user_id = interaction.user.id
-
         exp_manager = ExpManager(self.bot.db, getattr(self.bot, "sheets", None))
         profile = await exp_manager.ensure_profile(user_id)
-
         embed = discord.Embed(title=f"⚔️ {interaction.user.display_name} のクエスト状況", color=config.COLOR_QUEST)
         embed.add_field(name="🏅 称号", value=profile["current_title"] or "未設定", inline=True)
         embed.add_field(name="📊 レベル", value=f"Lv.{profile['level']}", inline=True)
         embed.add_field(name="💰 累計EXP", value=f"{profile['total_exp']} EXP", inline=True)
-
-        # プログレスバー
         next_exp = TitleSystem.get_exp_for_next_level(profile["level"])
         current_level_exp = profile["level"] ** 2 * config.EXP_PER_LEVEL_UNIT
         progress = profile["total_exp"] - current_level_exp
@@ -370,8 +564,6 @@ class PersistentHubView(discord.ui.View):
         bar = "▓" * filled + "░" * (10 - filled)
         remaining = max(0, next_exp - profile["total_exp"])
         embed.add_field(name="📈 次のレベルまで", value=f"[{bar}] 残り **{remaining} EXP**", inline=False)
-
-        # 今週のクエスト
         if self.bot.sheets:
             try:
                 week_start = self.bot.sheets.get_current_week_start()
@@ -381,21 +573,17 @@ class PersistentHubView(discord.ui.View):
                 completed_titles = {c["quest_title"] for c in completions}
                 if user_quests:
                     lines = [f"{'✅' if q['quest_title'] in completed_titles else '⬜'} {q['quest_title']}" for q in user_quests]
-                    embed.add_field(
-                        name=f"📋 今週のクエスト ({len(completed_titles)}/{len(user_quests)})",
-                        value="\n".join(lines), inline=False,
-                    )
+                    embed.add_field(name=f"📋 今週のクエスト ({len(completed_titles)}/{len(user_quests)})", value="\n".join(lines), inline=False)
             except Exception as e:
                 logger.warning(f"⚠️ クエスト情報取得エラー: {e}")
-
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.set_footer(text="しんちょくん 🤖")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="🎯 マイルストーン", style=discord.ButtonStyle.secondary, custom_id="hub_milestone_btn", row=1)
+    @discord.ui.button(label="🎯 今後の目標", style=discord.ButtonStyle.secondary, custom_id="hub_milestone_btn", row=1)
     async def milestone_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         today = datetime.now(JST).date()
-        embed = discord.Embed(title="🎯 プロジェクトマイルストーン", color=config.COLOR_PRIMARY)
+        embed = discord.Embed(title="🎯 今後の目標", color=config.COLOR_PRIMARY)
         for ms in config.MILESTONES:
             deadline = datetime.strptime(ms["deadline"], "%Y-%m-%d").date()
             days = (deadline - today).days
@@ -411,12 +599,10 @@ class PersistentHubView(discord.ui.View):
         embed.set_footer(text="しんちょくん 🤖")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @discord.ui.button(label="🎁 ピアボーナス", style=discord.ButtonStyle.success, custom_id="hub_peer_btn", row=2)
+    @discord.ui.button(label="💌 ありがとうを送る", style=discord.ButtonStyle.success, custom_id="hub_peer_btn", row=2)
     async def peer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = PeerBonusSelectView(self.bot, interaction.user.id)
-        await interaction.response.send_message(
-            "🎁 **感謝を送る相手を選んでください**", view=view, ephemeral=True
-        )
+        await interaction.response.send_message("💌 **感謝を送る相手を選んでください**", view=view, ephemeral=True)
 
     @discord.ui.button(label="🏆 ランキング", style=discord.ButtonStyle.secondary, custom_id="hub_ranking_btn", row=2)
     async def ranking_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -431,13 +617,14 @@ class PersistentHubView(discord.ui.View):
             user = self.bot.get_user(p["discord_id"])
             name = user.display_name if user else f"ID:{p['discord_id']}"
             medal = medals[i] if i < len(medals) else f"{i+1}."
-            embed.add_field(
-                name=f"{medal} {name}",
-                value=f"🏅 {p['current_title']}\n📊 Lv.{p['level']} | 💰 {p['total_exp']} EXP",
-                inline=False,
-            )
+            embed.add_field(name=f"{medal} {name}", value=f"🏅 {p['current_title']}\n📊 Lv.{p['level']} | 💰 {p['total_exp']} EXP", inline=False)
         embed.set_footer(text="しんちょくん 🤖 | ランキング")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="📝 タスク申請", style=discord.ButtonStyle.primary, custom_id="hub_task_btn", row=3)
+    async def task_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = TaskWeekSelectView(self.bot)
+        await interaction.response.send_message("📝 **どの週にタスクを申請しますか？**", view=view, ephemeral=True)
 
 
 # ============================================
@@ -462,11 +649,12 @@ class HubCog(commands.Cog):
                 "以下のボタンから各機能を利用できます。\n"
                 "ボタンを押すと**あなただけに見える**メッセージで応答します。\n\n"
                 "🆘 **SOS** — 困ったときにメンターに相談\n"
-                "📅 **ミーティング** — 打ち合わせの調整（複数人OK）\n"
+                "📅 **ミーティング** — 個別打診 or 全体日程調整\n"
                 "⚔️ **クエスト状況** — 自分のクエスト・EXP確認\n"
-                "🎯 **マイルストーン** — プロジェクト締切確認\n"
-                "🎁 **ピアボーナス** — メンバーに感謝を送る\n"
-                "🏆 **ランキング** — チームのEXPランキング"
+                "🎯 **今後の目標** — プロジェクト締切確認\n"
+                "💌 **ありがとうを送る** — メンバーに感謝を送る\n"
+                "🏆 **ランキング** — チームのEXPランキング\n"
+                "📝 **タスク申請** — リーダーにタスク追加を申請"
             ),
             color=config.COLOR_PRIMARY,
         )
@@ -480,3 +668,4 @@ class HubCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(HubCog(bot))
+

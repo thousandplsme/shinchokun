@@ -1,10 +1,9 @@
 """
-bot.py — しんちょくん エントリーポイント（v2.1 改修版）
+bot.py — しんちょくん エントリーポイント（v2.2）
 
-v2.1 変更点:
-- Azure接続安定化（再接続ログ強化、同時起動検知）
-- cogs/sos.py → cogs/hub.py に切替
-- PersistentHubView を永続View登録
+v2.2 変更点:
+- cogs/scheduler.py 追加（日程調整「調整さん」方式）
+- 期限切れ投票の自動集計ジョブ追加
 """
 
 import os
@@ -81,9 +80,10 @@ class ShinchokuBot(commands.Bot):
         cog_list = [
             "cogs.quest",
             "cogs.hub",       # SOS統合 + 全機能フォーム
-            "cogs.meeting",   # 応答Viewのみ
+            "cogs.meeting",   # 個別打診応答View
+            "cogs.scheduler", # 日程調整（調整さん方式）
             "cogs.summary",
-            "cogs.commands",  # 管理者コマンドのみ
+            "cogs.commands",  # 管理者コマンド
         ]
         for cog in cog_list:
             try:
@@ -135,6 +135,16 @@ class ShinchokuBot(commands.Bot):
                 id="weekly_summary", replace_existing=True,
             )
             logger.info(f"  📊 週次サマリージョブ登録: {config.SUMMARY_DAY} {config.SUMMARY_HOUR}:00")
+
+        # 日程調整の期限切れチェック（毎時）
+        scheduler_cog = self.get_cog("SchedulerCog")
+        if scheduler_cog:
+            self.scheduler.add_job(
+                scheduler_cog.check_expired_polls,
+                CronTrigger(minute=0, timezone=config.TIMEZONE),
+                id="poll_expire_check", replace_existing=True,
+            )
+            logger.info("  📊 投票期限チェックジョブ登録: 毎時")
 
     # === Azure安定化: イベント監視 ===
 

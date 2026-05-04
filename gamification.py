@@ -140,10 +140,12 @@ class ExpManager:
         self.sheets = sheets_client
         self.title_system = TitleSystem()
 
-    async def ensure_profile(self, discord_id: int, job_type: str = "") -> dict:
+    async def ensure_profile(self, discord_id: int, job_type: str = "", guild: discord.Guild = None) -> dict:
         """
         ユーザープロフィールが存在することを保証する。
         存在しなければ初期値で作成する。
+        
+        【v2.2 変更】guild 引数を追加。初回作成時にもロール付与を実行。
         
         【このパターンの目的】
         初回のEXP獲得時にプロフィールが存在しないとエラーになる。
@@ -169,6 +171,11 @@ class ExpManager:
                 consecutive_weeks=0,
             )
             profile = await self.db.get_user_profile(discord_id)
+
+            # 初回作成時にもロールを付与する（v2.2）
+            if guild and title:
+                await self._update_role(guild, discord_id, "", title, 1)
+
         return profile
 
     async def grant_exp(

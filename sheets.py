@@ -296,6 +296,53 @@ class SheetsClient:
         await asyncio.to_thread(_append)
         logger.info(f"📝 EXPログ追記: ID={discord_id}, +{amount} ({reason})")
 
+    @with_retry(max_retries=3, base_delay=2.0, exceptions=(gspread.exceptions.APIError,))
+    async def get_all_exp_logs(self) -> list[dict]:
+        """
+        EXPログシートの全行を取得する（/sync_exp 用）。
+
+        Returns:
+            [{discord_id: int, amount: int, reason: str, timestamp: str}, ...]
+        """
+        def _read():
+            try:
+                worksheet = self._spreadsheet.worksheet("EXPログ")
+                return worksheet.get_all_records()
+            except gspread.exceptions.WorksheetNotFound:
+                return []
+
+        records = await asyncio.to_thread(_read)
+        result = []
+        for r in records:
+            try:
+                result.append({
+                    "discord_id": int(r.get("discord_id", 0)),
+                    "amount": int(r.get("amount", 0)),
+                    "reason": str(r.get("reason", "")),
+                    "timestamp": str(r.get("timestamp", "")),
+                })
+            except (ValueError, TypeError):
+                continue
+        return result
+
+    @with_retry(max_retries=3, base_delay=2.0, exceptions=(gspread.exceptions.APIError,))
+    async def append_quest_row(
+        self, week_start: str, discord_id: int, quest_title: str,
+        quest_detail: str, exp_reward: int, status: str = "未着手",
+    ):
+        """
+        「週次タスク」シートに1行追加する（タスク承認時に使用）。
+        """
+        def _append():
+            worksheet = self._spreadsheet.worksheet("週次タスク")
+            worksheet.append_row(
+                [week_start, str(discord_id), quest_title, quest_detail, exp_reward, status],
+                value_input_option="USER_ENTERED",
+            )
+
+        await asyncio.to_thread(_append)
+        logger.info(f"📝 週次タスク追記: {quest_title} ({week_start})")
+
     # ============================================
     # ユーティリティ
     # ============================================
