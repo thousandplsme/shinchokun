@@ -79,10 +79,10 @@ TIMEZONE = "Asia/Tokyo"
 # --- EXP獲得量 ---
 EXP_REWARDS = {
     "quest_complete": None,  # スプレッドシートの exp_reward 値を使用
-    "sos_send": 5,           # SOS送信ボーナス（困りごとを共有した勇気）
-    "streak_bonus": 15,      # 3週連続クエスト達成ボーナス
-    "peer_bonus_send": 3,    # ピアボーナス送信者（感謝を伝えた行動に報酬）
-    "peer_bonus_receive": 3, # ピアボーナス受信者
+    "sos_send": 20,          # SOS送信ボーナス（困りごとを共有した勇気）
+    "streak_bonus": 100,     # 3週連続クエスト達成ボーナス
+    "peer_bonus_send": 15,   # ピアボーナス送信者（感謝を伝えた行動に報酬）
+    "peer_bonus_receive": 15, # ピアボーナス受信者
 }
 
 # ピアボーナス1日あたりの送信上限

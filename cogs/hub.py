@@ -1,4 +1,4 @@
-﻿"""
+"""
 cogs/hub.py — 統合コマンドチャンネル（v2.1）
 
 SOSチャンネルを「しんちょくんコマンドチャンネル」に統合し、
@@ -396,6 +396,11 @@ class TaskApprovalView(discord.ui.View):
         self.bot = bot
         self.request_id = request_id
 
+    async def _disable_buttons(self, interaction: discord.Interaction):
+        for child in self.children:
+            child.disabled = True
+        await interaction.edit_original_response(view=self)
+
     @discord.ui.button(label="✅ 承認", style=discord.ButtonStyle.success)
     async def approve_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
@@ -427,20 +432,24 @@ class TaskApprovalView(discord.ui.View):
         except Exception as e:
             logger.error(f"❌ 承認通知エラー: {e}")
 
-        for child in self.children:
-            child.disabled = True
-        await interaction.edit_original_response(view=self)
+        await self._disable_buttons(interaction)
         await interaction.followup.send("✅ 承認しました！ Sheetsに追記済みです。", ephemeral=True)
 
-    @discord.ui.button(label="❌ 却下", style=discord.ButtonStyle.danger)
-    async def reject_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        modal = TaskRejectModal(self.bot, self.request_id)
+    @discord.ui.button(label="📝 採用（変更あり）", style=discord.ButtonStyle.primary)
+    async def adopt_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = TaskAdoptModal(self.bot, self.request_id)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="🤔 検討", style=discord.ButtonStyle.secondary)
+    async def review_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = TaskReviewModal(self.bot, self.request_id)
         await interaction.response.send_modal(modal)
 
 
-class TaskRejectModal(discord.ui.Modal, title="❌ 却下理由"):
-    reason_input = discord.ui.TextInput(
-        label="却下理由", placeholder="例: EXP量を調整してください",
+class TaskAdoptModal(discord.ui.Modal, title="📝 採用（変更あり）"):
+    comment_input = discord.ui.TextInput(
+        label="変更内容・コメント",
+        placeholder="例: EXPを50に変更して採用します",
         style=discord.TextStyle.paragraph, required=True, max_length=500,
     )
 
@@ -456,22 +465,69 @@ class TaskRejectModal(discord.ui.Modal, title="❌ 却下理由"):
             await interaction.followup.send("⚠️ この申請は処理済みです。", ephemeral=True)
             return
 
-        reason = self.reason_input.value.strip()
-        await self.bot.db.update_task_request(self.request_id, "rejected", interaction.user.id, reason)
+        comment = self.comment_input.value.strip()
+        await self.bot.db.update_task_request(self.request_id, "adopted", interaction.user.id, comment)
+
+        if self.bot.sheets:
+            try:
+                await self.bot.sheets.append_quest_row(
+                    req["week_start"], req["discord_id"],
+                    req["quest_title"], req["quest_detail"], req["requested_exp"],
+                )
+            except Exception as e:
+                logger.error(f"❌ Sheetsタスク追記エラー: {e}")
 
         try:
             user = await self.bot.fetch_user(req["discord_id"])
             if user:
-                embed = discord.Embed(title="❌ タスク申請が却下されました", color=config.COLOR_DANGER)
+                embed = discord.Embed(title="📝 タスク申請が採用されました！", color=config.COLOR_PRIMARY)
                 embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
-                embed.add_field(name="💬 理由", value=reason, inline=False)
-                embed.set_footer(text="しんちょくん 🤖")
+                embed.add_field(name="💬 リーダーより", value=comment, inline=False)
+                embed.add_field(name="⭐ EXP", value=f"{req['requested_exp']} EXP", inline=True)
+                embed.set_footer(text="しんちょくん 🤖 | 内容に変更がある場合があります")
                 async with dm_limiter:
                     await user.send(embed=embed)
         except Exception as e:
-            logger.error(f"❌ 却下通知エラー: {e}")
+            logger.error(f"❌ 採用通知エラー: {e}")
 
-        await interaction.followup.send("✅ 却下しました。申請者に通知済みです。", ephemeral=True)
+        await interaction.followup.send("📝 採用しました！ Sheetsに追記済みです。", ephemeral=True)
+
+
+class TaskReviewModal(discord.ui.Modal, title="🤔 検討中"):
+    comment_input = discord.ui.TextInput(
+        label="コメント（申請者に伝えたいこと）",
+        placeholder="例: 来週に回せるか確認させてください",
+        style=discord.TextStyle.paragraph, required=True, max_length=500,
+    )
+
+    def __init__(self, bot: commands.Bot, request_id: int):
+        super().__init__()
+        self.bot = bot
+        self.request_id = request_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        req = await self.bot.db.get_task_request(self.request_id)
+        if not req or req["status"] != "pending":
+            await interaction.followup.send("⚠️ この申請は処理済みです。", ephemeral=True)
+            return
+
+        comment = self.comment_input.value.strip()
+        await self.bot.db.update_task_request(self.request_id, "reviewing", interaction.user.id, comment)
+
+        try:
+            user = await self.bot.fetch_user(req["discord_id"])
+            if user:
+                embed = discord.Embed(title="🤔 タスク申請を検討中です", color=config.COLOR_WARNING)
+                embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
+                embed.add_field(name="💬 リーダーより", value=comment, inline=False)
+                embed.set_footer(text="しんちょくん 🤖 | 後日改めて連絡があります")
+                async with dm_limiter:
+                    await user.send(embed=embed)
+        except Exception as e:
+            logger.error(f"❌ 検討通知エラー: {e}")
+
+        await interaction.followup.send("🤔 検討中にしました。申請者に通知済みです。", ephemeral=True)
 
 
 # ============================================
