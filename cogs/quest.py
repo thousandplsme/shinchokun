@@ -344,6 +344,9 @@ class QuestCog(commands.Cog):
         # defaultdict 的な処理: member_id → [quest1, quest2, ...]
         member_quests: dict[int, list[dict]] = {}
         for q in quests:
+            # 未送信（sent = False）のものだけを対象とする
+            if q.get("sent", False):
+                continue
             uid = q["discord_id"]
             if uid not in member_quests:
                 member_quests[uid] = []
@@ -356,7 +359,7 @@ class QuestCog(commands.Cog):
             if uid not in member_quests:
                 continue
 
-            user_quests = member_quests[uid]
+            user_quests = member_quests[uid][:5] # 最大5件までに制限
             autonomy = member_info.get("autonomy_level", "low")
 
             try:
@@ -372,6 +375,13 @@ class QuestCog(commands.Cog):
                 view = QuestView(self.bot)
                 async with dm_limiter:
                     await user.send(embed=embed, view=view)
+
+                # 送信成功したクエストの sent フラグを TRUE に更新
+                for q in user_quests:
+                    try:
+                        await sheets.update_quest_sent_status(week_start, uid, q["quest_title"], True)
+                    except Exception as e:
+                        logger.error(f"⚠️ sentフラグ更新失敗: {q['quest_title']} - {e}")
 
                 sent_count += 1
                 logger.info(f"📩 クエスト配信: {user.name} ({len(user_quests)}件)")

@@ -22,7 +22,7 @@ from rate_limiter import dm_limiter
 logger = logging.getLogger(__name__)
 JST = timezone(timedelta(hours=9))
 
-POLL_EXPIRE_HOURS = 48
+POLL_EXPIRE_HOURS = 36
 
 
 # ============================================
@@ -137,13 +137,14 @@ class ScheduleVoteView(discord.ui.View):
 
     async def vote_callback(self, interaction: discord.Interaction):
         selected = interaction.data["values"]
-        await self.bot.db.save_schedule_vote(
+        is_new = await self.bot.db.save_schedule_vote(
             self.poll_id, interaction.user.id,
             json.dumps(selected, ensure_ascii=False),
         )
 
+        msg = "✅ 回答を送信しました！" if is_new else "🔄 回答を更新しました！"
         await interaction.response.send_message(
-            f"✅ 回答を送信しました！\n選択: {', '.join(selected)}",
+            f"{msg}\n選択: {', '.join(selected)}",
             ephemeral=True,
         )
         logger.info(f"📊 投票受信: poll_id={self.poll_id}, user={interaction.user.id}")

@@ -667,9 +667,17 @@ class Database:
     async def save_schedule_vote(
         self, poll_id: int, discord_id: int, selected_json: str
     ) -> bool:
-        """投票を保存（UPSERT）。新規ならTrue"""
+        """投票を保存（UPSERT）。新規ならTrue、更新ならFalseを返す"""
         async with aiosqlite.connect(self.db_path) as db:
             try:
+                # 既存の投票があるかチェック
+                cursor = await db.execute(
+                    "SELECT 1 FROM schedule_votes WHERE poll_id = ? AND discord_id = ?",
+                    (poll_id, discord_id)
+                )
+                existing = await cursor.fetchone()
+                is_new = existing is None
+
                 await db.execute(
                     """INSERT INTO schedule_votes (poll_id, discord_id, selected_slots, created_at)
                        VALUES (?, ?, ?, ?)
@@ -679,9 +687,10 @@ class Database:
                     (poll_id, discord_id, selected_json, now_jst().isoformat()),
                 )
                 await db.commit()
-                return True
-            except Exception:
-                return False
+                return is_new
+            except Exception as e:
+                logger.error(f"❌ 投票保存エラー: {e}")
+                return True # エラー時はとりあえず新規扱い（または例外スロー）
 
     async def get_schedule_poll(self, poll_id: int) -> dict | None:
         """投票情報を取得する"""

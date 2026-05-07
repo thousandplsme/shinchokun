@@ -254,6 +254,11 @@ class SheetsClient:
                     r["exp_reward"] = int(r.get("exp_reward", 10))
                 except (ValueError, TypeError):
                     r["exp_reward"] = 10
+                    
+                # sent列（TRUE/FALSE）の読み取り
+                sent_val = str(r.get("sent", "FALSE")).strip().upper()
+                r["sent"] = (sent_val == "TRUE")
+                
                 quests.append(r)
         return quests
 
@@ -297,6 +302,37 @@ class SheetsClient:
             logger.info(f"✅ クエスト更新: {quest_title} → {new_status}")
         else:
             logger.warning(f"⚠️ クエストが見つかりません: {quest_title}")
+        return result
+
+    @with_retry(max_retries=3, base_delay=2.0, exceptions=(gspread.exceptions.APIError,))
+    async def update_quest_sent_status(self, week_start: str, discord_id: int, quest_title: str, is_sent: bool = True):
+        """クエストのsent列を更新する"""
+        def _update():
+            worksheet = self._spreadsheet.worksheet("週次タスク")
+            records = worksheet.get_all_records()
+            headers = worksheet.row_values(1)
+
+            # sent列がない場合は無視
+            if "sent" not in headers:
+                logger.warning("⚠️ シートに 'sent' 列が存在しません")
+                return False
+
+            sent_col = headers.index("sent") + 1
+
+            for i, r in enumerate(records):
+                row_num = i + 2
+                if (
+                    str(r.get("week_start", "")) == week_start
+                    and int(r.get("discord_id", 0)) == discord_id
+                    and r.get("quest_title", "") == quest_title
+                ):
+                    worksheet.update_cell(row_num, sent_col, "TRUE" if is_sent else "FALSE")
+                    return True
+            return False
+
+        result = await asyncio.to_thread(_update)
+        if result:
+            logger.info(f"✅ クエスト送信フラグ更新: {quest_title} → {is_sent}")
         return result
 
     # ============================================

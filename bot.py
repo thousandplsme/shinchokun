@@ -80,6 +80,7 @@ class ShinchokuBot(commands.Bot):
         cog_list = [
             "cogs.quest",
             "cogs.hub",       # SOS統合 + 全機能フォーム
+            "cogs.admin_hub", # 管理者専用コマンドハブ＆隠し称号
             "cogs.meeting",   # 個別打診応答View
             "cogs.scheduler", # 日程調整（調整さん方式）
             "cogs.summary",

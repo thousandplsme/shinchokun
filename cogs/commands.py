@@ -223,6 +223,67 @@ class CommandsCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
         logger.info(f"🏅 ロール同期完了: {success}/{len(member_ids)}人")
 
+    @app_commands.command(name="send_quest", description="特定メンバーに未送信のクエストを追加配信します")
+    @app_commands.default_permissions(administrator=True)
+    async def send_quest(self, interaction: discord.Interaction, target: discord.Member):
+        await interaction.response.defer(ephemeral=True)
+        quest_cog = self.bot.get_cog("QuestCog")
+        if not quest_cog:
+            await interaction.followup.send("⚠️ QuestCogが読み込まれていません。", ephemeral=True)
+            return
+        
+        sheets = self.bot.sheets
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
+        try:
+            week_start = sheets.get_current_week_start()
+            quests = await sheets.get_weekly_quests(week_start)
+        except Exception as e:
+            logger.error(f"❌ send_quest: データ取得エラー: {e}")
+            await interaction.followup.send(f"❌ データ取得に失敗しました:\n```{e}```", ephemeral=True)
+            return
+
+        # 対象ユーザーの未送信クエストを抽出
+        user_quests = [q for q in quests if q["discord_id"] == target.id and not q.get("sent", False)]
+        
+        if not user_quests:
+            await interaction.followup.send(f"✅ {target.display_name} さんの未送信クエストはありません。", ephemeral=True)
+            return
+
+        # 最大5件に制限
+        user_quests = user_quests[:5]
+        
+        # autonomy_level の取得
+        member_info = sheets.get_member(target.id)
+        autonomy = member_info.get("autonomy_level", "low") if member_info else "low"
+
+        # QuestCog のメソッドを使って送信
+        try:
+            embed = quest_cog._build_quest_embed(user_quests, autonomy, week_start, target.id)
+            # from cogs.quest import QuestView (QuestCog に依存するため直接インスタンス化できない場合は注意)
+            # ここではQuestCogに依存するUI要素を取得するのが難しいため、
+            # 簡単な方法として QuestCog 側に send_quest_to_user メソッドを設ける方がクリーンですが、
+            # UIクラスを直接インポートして使用します。
+            from cogs.quest import QuestView
+            view = QuestView(self.bot)
+            
+            await target.send(embed=embed, view=view)
+            
+            # sent フラグの更新
+            for q in user_quests:
+                await sheets.update_quest_sent_status(week_start, target.id, q["quest_title"], True)
+                
+            await interaction.followup.send(f"✅ {target.display_name} さんに {len(user_quests)}件 のクエストを追加配信しました！", ephemeral=True)
+            logger.info(f"📩 追加クエスト配信: {target.name} ({len(user_quests)}件)")
+            
+        except discord.Forbidden:
+            await interaction.followup.send(f"⚠️ {target.display_name} さんにDMを送信できませんでした。", ephemeral=True)
+        except Exception as e:
+            logger.error(f"❌ send_quest 送信エラー: {e}")
+            await interaction.followup.send(f"❌ 送信中にエラーが発生しました:\n```{e}```", ephemeral=True)
+
     @app_commands.command(name="help_bot", description="管理者用コマンド一覧を表示します")
     @app_commands.default_permissions(administrator=True)
     async def help_bot(self, interaction: discord.Interaction):
@@ -235,6 +296,7 @@ class CommandsCog(commands.Cog):
             ("`/ping`", "Botの応答確認"),
             ("`/setup_hub`", "コマンドチャンネルに常設フォームを設置"),
             ("`/test_quest`", "クエスト配信を手動実行"),
+            ("`/send_quest`", "特定メンバーに未送信クエストを追加配信"),
             ("`/test_summary`", "週次サマリーを手動投稿"),
             ("`/sync_exp`", "SheetsのEXPログからDB再計算"),
             ("`/sync_roles`", "全メンバーの称号ロールを一括付与"),
