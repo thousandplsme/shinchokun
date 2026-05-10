@@ -580,6 +580,49 @@ class TaskWeekSelectView(discord.ui.View):
 # 統合コマンドチャンネル常設View（永続）v2.2
 # ============================================
 
+class ResendQuestView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, pending_quests: list[dict], week_start: str):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.pending_quests = pending_quests
+        self.week_start = week_start
+
+    @discord.ui.button(label="📩 未完クエストをDMに再通知する", style=discord.ButtonStyle.primary)
+    async def resend_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        quest_cog = self.bot.get_cog("QuestCog")
+        if quest_cog is None:
+            await interaction.followup.send("⚠️ クエスト機能が現在利用できません。", ephemeral=True)
+            return
+            
+        try:
+            user_quests = self.pending_quests[:5]
+            user_id = interaction.user.id
+            members = self.bot.sheets.get_members()
+            autonomy = "low"
+            for m in members:
+                if m["discord_id"] == user_id:
+                    autonomy = m.get("autonomy_level", "low")
+                    break
+
+            embed = quest_cog._build_quest_embed(user_quests, autonomy, self.week_start, user_id)
+            from cogs.quest import QuestView
+            view = QuestView(self.bot)
+            
+            await interaction.user.send(embed=embed, view=view)
+            await interaction.followup.send("✅ DMに未完クエストを再通知しました！", ephemeral=True)
+            
+            button.disabled = True
+            button.label = "📩 再通知済み"
+            await interaction.edit_original_response(view=self)
+            
+        except discord.Forbidden:
+            await interaction.followup.send("⚠️ DMを送信できませんでした。サーバーのプライバシー設定を確認してください。", ephemeral=True)
+        except Exception as e:
+            logger.error(f"❌ 再送信エラー: {e}")
+            await interaction.followup.send(f"❌ 送信に失敗しました: {e}", ephemeral=True)
+
+
 class PersistentHubView(discord.ui.View):
     """全機能を集約した永続ボタンView（v2.2）"""
 
@@ -620,6 +663,7 @@ class PersistentHubView(discord.ui.View):
         bar = "▓" * filled + "░" * (10 - filled)
         remaining = max(0, next_exp - profile["total_exp"])
         embed.add_field(name="📈 次のレベルまで", value=f"[{bar}] 残り **{remaining} EXP**", inline=False)
+        pending_quests = []
         if self.bot.sheets:
             try:
                 week_start = self.bot.sheets.get_current_week_start()
@@ -628,13 +672,25 @@ class PersistentHubView(discord.ui.View):
                 completions = await self.bot.db.get_quest_completions(user_id, week_start)
                 completed_titles = {c["quest_title"] for c in completions}
                 if user_quests:
-                    lines = [f"{'✅' if q['quest_title'] in completed_titles else '⬜'} {q['quest_title']}" for q in user_quests]
+                    lines = []
+                    for q in user_quests:
+                        if q['quest_title'] in completed_titles:
+                            lines.append(f"✅ {q['quest_title']}")
+                        else:
+                            if q.get("status") not in ["辞退", "延長"]:
+                                pending_quests.append(q)
+                            lines.append(f"⬜ {q['quest_title']}")
                     embed.add_field(name=f"📋 今週のクエスト ({len(completed_titles)}/{len(user_quests)})", value="\n".join(lines), inline=False)
             except Exception as e:
                 logger.warning(f"⚠️ クエスト情報取得エラー: {e}")
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.set_footer(text="しんちょくん 🤖")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        view = None
+        if pending_quests:
+            view = ResendQuestView(self.bot, pending_quests, week_start)
+            
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="🎯 今後の目標", style=discord.ButtonStyle.secondary, custom_id="hub_milestone_btn", row=1)
     async def milestone_button(self, interaction: discord.Interaction, button: discord.ui.Button):

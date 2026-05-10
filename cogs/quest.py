@@ -59,16 +59,25 @@ class QuestView(discord.ui.View):
         custom_id="quest_complete_btn",
     )
     async def complete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """
-        完了ボタンが押された時の処理。
-        
-        【処理フロー】
-        1. Google Sheetsから今週のクエストを取得
-        2. このユーザーのクエストを特定
-        3. 未完了のクエストがあれば完了処理
-        4. EXP付与 → 演出メッセージ
-        5. 全体チャンネル共有の提案
-        """
+        await self._handle_quest_action(interaction, "complete")
+
+    @discord.ui.button(
+        label="❓ もっと詳しく",
+        style=discord.ButtonStyle.secondary,
+        custom_id="quest_question_btn",
+    )
+    async def question_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_quest_action(interaction, "question")
+
+    @discord.ui.button(
+        label="⏸️ 辞退する",
+        style=discord.ButtonStyle.danger,
+        custom_id="quest_decline_btn",
+    )
+    async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_quest_action(interaction, "decline")
+
+    async def _handle_quest_action(self, interaction: discord.Interaction, action: str):
         await interaction.response.defer(ephemeral=True)
 
         user_id = interaction.user.id
@@ -80,37 +89,37 @@ class QuestView(discord.ui.View):
         user_quests = [q for q in quests if q["discord_id"] == user_id]
 
         if not user_quests:
-            await interaction.followup.send(
-                "⚠️ 今週のクエストが見つかりません。", ephemeral=True
-            )
+            await interaction.followup.send("⚠️ 今週のクエストが見つかりません。", ephemeral=True)
             return
 
-        # 完了済みクエストをDBから取得
+        # 完了・辞退・延長済みのクエストを除外（未着手・進行中のみ対象）
         completions = await self.bot.db.get_quest_completions(user_id, week_start)
         completed_titles = {c["quest_title"] for c in completions}
 
-        # 未完了のクエストを1つ完了させる
-        pending_quests = [q for q in user_quests if q["quest_title"] not in completed_titles]
+        pending_quests = []
+        for q in user_quests:
+            if q["quest_title"] not in completed_titles and q["status"] in ["未着手", "進行中"]:
+                pending_quests.append(q)
 
         if not pending_quests:
-            await interaction.followup.send(
-                "🎉 今週のクエストは**すべて完了**しています！ お疲れさまでした！ 🏆",
-                ephemeral=True,
-            )
+            await interaction.followup.send("🎉 今週の未完了クエストはありません！", ephemeral=True)
             return
 
-        # 未完了が複数ある場合はセレクトメニューを表示
-        if len(pending_quests) > 1:
-            view = QuestSelectView(self.bot, pending_quests, week_start)
-            await interaction.followup.send(
-                "どのクエストを完了しますか？ 🗡️",
-                view=view,
-                ephemeral=True,
-            )
-        else:
-            # 1つだけなら直接完了処理
-            quest = pending_quests[0]
-            await self._complete_quest(interaction, quest, week_start)
+        if action == "complete":
+            if len(pending_quests) > 1:
+                view = QuestSelectView(self.bot, pending_quests, week_start)
+                await interaction.followup.send("どのクエストを完了しますか？ 🗡️", view=view, ephemeral=True)
+            else:
+                quest = pending_quests[0]
+                await self._complete_quest(interaction, quest, week_start)
+                
+        elif action == "question":
+            view = QuestQuestionSelectView(self.bot, pending_quests)
+            await interaction.followup.send("❓ どのクエストについて質問しますか？", view=view, ephemeral=True)
+            
+        elif action == "decline":
+            view = QuestDeclineSelectView(self.bot, pending_quests, week_start)
+            await interaction.followup.send("⏸️ どのクエストを辞退しますか？", view=view, ephemeral=True)
 
     async def _complete_quest(self, interaction: discord.Interaction, quest: dict, week_start: str):
         """クエスト完了の共通処理"""
@@ -284,6 +293,166 @@ class QuestShareView(discord.ui.View):
 
 
 # ============================================
+# クエスト質問・辞退用 UI
+# ============================================
+
+class QuestQuestionModal(discord.ui.Modal):
+    question = discord.ui.TextInput(
+        label="質問内容",
+        placeholder="例: このタスクの仕様について確認したいです...",
+        style=discord.TextStyle.paragraph, required=True, max_length=1000,
+    )
+
+    def __init__(self, bot: commands.Bot, quest_title: str):
+        short_title = quest_title if len(quest_title) <= 35 else quest_title[:32] + "..."
+        super().__init__(title=f"{short_title} について")
+        self.bot = bot
+        self.quest_title = quest_title
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
+        if not leader:
+            await interaction.followup.send("⚠️ リーダーのIDが設定されていません。", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="❓ クエストに関する質問",
+            description=f"**{interaction.user.display_name}** さんからクエストについての質問です。",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
+        embed.add_field(name="質問内容", value=self.question.value, inline=False)
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+
+        # 質問に返信するための特別な永続ではないView（今回はボタンのcustom_idにユーザーIDを入れる手法）
+        view = discord.ui.View(timeout=None)
+        btn = discord.ui.Button(
+            label="💬 返信する", style=discord.ButtonStyle.primary, 
+            custom_id=f"quest_reply_btn:{interaction.user.id}"
+        )
+        view.add_item(btn)
+
+        try:
+            await leader.send(embed=embed, view=view)
+            await interaction.followup.send("✅ リーダーに質問を送信しました。回答をお待ちください。", ephemeral=True)
+        except Exception as e:
+            logger.error(f"❌ リーダーへのDM送信失敗: {e}")
+            await interaction.followup.send("❌ 質問の送信に失敗しました。", ephemeral=True)
+
+
+class QuestDeclineModal(discord.ui.Modal, title="⏸️ クエストを辞退する"):
+    reason = discord.ui.TextInput(
+        label="辞退の理由",
+        placeholder="例: 体調不良のため、今週は作業が難しいです。",
+        style=discord.TextStyle.paragraph, required=True, max_length=500,
+    )
+
+    def __init__(self, bot: commands.Bot, quest_title: str, week_start: str):
+        super().__init__()
+        self.bot = bot
+        self.quest_title = quest_title
+        self.week_start = week_start
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            await self.bot.sheets.update_quest_status(
+                self.week_start, interaction.user.id, self.quest_title, "辞退"
+            )
+        except Exception as e:
+            logger.error(f"❌ 辞退ステータス更新エラー: {e}")
+            await interaction.followup.send("⚠️ スプレッドシートの更新に失敗しました。", ephemeral=True)
+            return
+
+        leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
+        if leader:
+            embed = discord.Embed(
+                title="⏸️ クエスト辞退の通知",
+                description=f"**{interaction.user.display_name}** さんがクエストを辞退しました。",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
+            embed.add_field(name="理由", value=self.reason.value, inline=False)
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            try:
+                await leader.send(embed=embed)
+            except Exception:
+                pass
+
+        await interaction.followup.send("✅ クエストを辞退し、リーダーに通知しました。", ephemeral=True)
+
+
+class QuestQuestionSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, quests: list[dict]):
+        super().__init__(timeout=120)
+        self.bot = bot
+        options = [
+            discord.SelectOption(label=q["quest_title"][:100], value=q["quest_title"])
+            for q in quests
+        ]
+        select = discord.ui.Select(placeholder="質問するクエストを選択...", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        selected_title = interaction.data["values"][0]
+        modal = QuestQuestionModal(self.bot, selected_title)
+        await interaction.response.send_modal(modal)
+
+
+class QuestDeclineSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, quests: list[dict], week_start: str):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.week_start = week_start
+        options = [
+            discord.SelectOption(label=q["quest_title"][:100], value=q["quest_title"])
+            for q in quests
+        ]
+        select = discord.ui.Select(placeholder="辞退するクエストを選択...", options=options)
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        selected_title = interaction.data["values"][0]
+        modal = QuestDeclineModal(self.bot, selected_title, self.week_start)
+        await interaction.response.send_modal(modal)
+
+
+class QuestDetailReplyModal(discord.ui.Modal, title="💬 質問に返信する"):
+    reply_content = discord.ui.TextInput(
+        label="回答内容",
+        style=discord.TextStyle.paragraph, required=True, max_length=1000,
+    )
+
+    def __init__(self, bot: commands.Bot, target_user_id: int):
+        super().__init__()
+        self.bot = bot
+        self.target_user_id = target_user_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        target_user = self.bot.get_user(self.target_user_id)
+        if not target_user:
+            await interaction.followup.send("⚠️ ユーザーが見つかりません。", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title="💬 リーダーからの回答",
+            description=self.reply_content.value,
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="しんちょくん 🤖")
+        try:
+            await target_user.send(embed=embed)
+            await interaction.followup.send("✅ 回答を送信しました。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 送信エラー: {e}", ephemeral=True)
+
+
+# ============================================
 # クエスト配信Cog
 # ============================================
 
@@ -321,6 +490,25 @@ class QuestCog(commands.Cog):
 
         try:
             week_start = sheets.get_current_week_start()
+            
+            # --- 先週の未回答クエストを自動延長 ---
+            try:
+                last_week = sheets.get_last_week_start()
+                last_week_quests = await sheets.get_weekly_quests(last_week)
+                for q in last_week_quests:
+                    if q.get("status") in ["未着手", "進行中"]:
+                        await sheets.update_quest_status(last_week, q["discord_id"], q["quest_title"], "延長")
+                        await sheets.duplicate_quest_to_next_week(last_week, q["discord_id"], q["quest_title"], week_start)
+                        # リーダーへ通知
+                        leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
+                        if leader:
+                            member = self.bot.get_user(q["discord_id"])
+                            name = member.display_name if member else f"ID:{q['discord_id']}"
+                            await leader.send(f"⚠️ **自動延長処理**: {name} さんのタスク『{q['quest_title']}』を未回答のため強制延長しました。")
+            except Exception as ex:
+                logger.error(f"❌ 自動延長処理に失敗: {ex}")
+            # -----------------------------------
+            
         except Exception as e:
             logger.error(f"❌ 週開始日の取得に失敗: {e}")
             await self.bot.notify_leader_error("クエスト配信: 週開始日取得", e)

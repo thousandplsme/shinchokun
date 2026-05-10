@@ -57,6 +57,7 @@ class ShinchokuBot(commands.Bot):
 
     async def setup_hook(self):
         logger.info("=== setup_hook 開始 ===")
+        self.tree.on_error = self.on_app_command_error
 
         # 1. DB初期化
         await self.db.init()
@@ -188,13 +189,14 @@ class ShinchokuBot(commands.Bot):
                 logger.info("⚡ 週次サマリー漏れ検知！ 自動投稿します")
                 await summary_cog.post_weekly_summary()
 
-    async def notify_leader_error(self, context: str, error: Exception):
+    async def notify_leader_error(self, context: str, error: Exception, tb: str = None):
         """
         エラー発生時にリーダーのDMに詳細を通知する。
 
         Args:
             context: エラー発生箇所の説明（例: "クエスト配信"）
             error: 発生した例外
+            tb: トレースバック情報
         """
         try:
             if self.sheets:
@@ -203,26 +205,54 @@ class ShinchokuBot(commands.Bot):
                     leader_user = await self.fetch_user(leader["discord_id"])
                     if leader_user:
                         embed = discord.Embed(
-                            title="⚠️ しんちょくん エラー通知",
-                            description=f"**{context}** でエラーが発生しました。",
+                            title="⚠️ しんちょくん 予期せぬエラー通知",
+                            description=f"**{context}** にてエラーが発生しました。",
                             color=config.COLOR_DANGER,
                         )
-                        error_text = str(error)[:1000]  # 長すぎる場合は切り詰め
-                        embed.add_field(name="📋 エラー詳細", value=f"```{error_text}```", inline=False)
+                        error_text = str(error)[:1000]
+                        embed.add_field(name="📋 エラー概要", value=f"```{error_text}```", inline=False)
+                        
+                        if tb:
+                            tb_text = tb[-1000:] # 末尾のスタックトレースのみ抽出
+                            embed.add_field(name="🔍 トレースバック (末尾)", value=f"```{tb_text}```", inline=False)
+                            
                         embed.add_field(
                             name="💡 対処方法",
                             value="bot.log を確認してください。\n自動復旧できない場合はBot再起動をお試しください。",
                             inline=False,
                         )
-                        embed.set_footer(text="しんちょくん 🤖 | エラー通知")
+                        embed.set_footer(text="しんちょくん 🤖 | 自動エラー検知")
                         await leader_user.send(embed=embed)
                         logger.info(f"📨 リーダーにエラー通知を送信: {context}")
         except Exception as notify_err:
             logger.warning(f"⚠️ リーダーへのエラー通知に失敗: {notify_err}")
 
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        cmd_name = interaction.command.name if interaction.command else "UI操作等"
+        logger.error(f"❌ インタラクションエラー ({cmd_name}): {error}")
+        
+        import traceback
+        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        user_info = f"{interaction.user.display_name} (ID: {interaction.user.id})"
+        
+        await self.notify_leader_error(f"操作: {cmd_name} | ユーザー: {user_info}", error, tb)
+        
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.send_message("❌ 予期せぬエラーが発生しました。リーダーに自動通知されました。", ephemeral=True)
+            except:
+                pass
+        else:
+            try:
+                await interaction.followup.send("❌ 予期せぬエラーが発生しました。リーダーに自動通知されました。", ephemeral=True)
+            except:
+                pass
+
     async def on_command_error(self, ctx, error):
-        logger.error(f"コマンドエラー: {error}")
-        await self.notify_leader_error(f"コマンド: {ctx.command}", error)
+        logger.error(f"❌ コマンドエラー: {error}")
+        import traceback
+        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        await self.notify_leader_error(f"テキストコマンド: {ctx.command}", error, tb)
 
 
 def main():

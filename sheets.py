@@ -400,17 +400,56 @@ class SheetsClient:
         quest_detail: str, exp_reward: int, status: str = "未着手",
     ):
         """
-        「週次タスク」シートに1行追加する（タスク承認時に使用）。
+        「週次タスク」シートに1行追加する。
         """
         def _append():
             worksheet = self._spreadsheet.worksheet("週次タスク")
+            # sent列（7列目）は空欄（FALSE相当）になるように追加
             worksheet.append_row(
-                [week_start, str(discord_id), quest_title, quest_detail, exp_reward, status],
+                [week_start, str(discord_id), quest_title, quest_detail, exp_reward, status, "FALSE"],
                 value_input_option="USER_ENTERED",
             )
 
         await asyncio.to_thread(_append)
         logger.info(f"📝 週次タスク追記: {quest_title} ({week_start})")
+
+    @with_retry(max_retries=3, base_delay=2.0, exceptions=(gspread.exceptions.APIError,))
+    async def duplicate_quest_to_next_week(self, week_start: str, discord_id: int, quest_title: str, new_week_start: str) -> bool:
+        """
+        指定したクエストの行をコピーし、week_startを更新して新しい行として追加する。
+        """
+        def _duplicate():
+            worksheet = self._spreadsheet.worksheet("週次タスク")
+            records = worksheet.get_all_records()
+            
+            target_row = None
+            for r in records:
+                if (
+                    str(r.get("week_start", "")) == week_start
+                    and int(r.get("discord_id", 0)) == discord_id
+                    and r.get("quest_title", "") == quest_title
+                ):
+                    target_row = r
+                    break
+            
+            if not target_row:
+                return False
+            
+            # detail と exp_reward をコピー
+            detail = str(target_row.get("quest_detail", ""))
+            exp = int(target_row.get("exp_reward", 10))
+            
+            # 新しい行を追加
+            worksheet.append_row(
+                [new_week_start, str(discord_id), quest_title, detail, exp, "未着手", "FALSE"],
+                value_input_option="USER_ENTERED",
+            )
+            return True
+
+        result = await asyncio.to_thread(_duplicate)
+        if result:
+            logger.info(f"📝 クエスト延長複製: {quest_title} ({week_start} -> {new_week_start})")
+        return result
 
     # ============================================
     # ユーティリティ
@@ -418,16 +457,24 @@ class SheetsClient:
 
     @staticmethod
     def get_current_week_start() -> str:
-        """
-        今週の月曜日の日付を "YYYY-MM-DD" 形式で返す。
-        
-        【weekday() の仕組み】
-        月曜=0, 火曜=1, ..., 日曜=6
-        「今日の日付 - weekday()日」で今週の月曜日が求まる。
-        """
+        """今週の月曜日の日付を返す"""
         today = datetime.now(JST).date()
         monday = today - timedelta(days=today.weekday())
         return monday.strftime("%Y-%m-%d")
+
+    @staticmethod
+    def get_last_week_start() -> str:
+        """先週の月曜日の日付を返す"""
+        today = datetime.now(JST).date()
+        last_monday = today - timedelta(days=today.weekday() + 7)
+        return last_monday.strftime("%Y-%m-%d")
+
+    @staticmethod
+    def get_next_week_start(current_week_start: str) -> str:
+        """指定された月曜日の『次の月曜日』の日付を返す"""
+        current_date = datetime.strptime(current_week_start, "%Y-%m-%d").date()
+        next_monday = current_date + timedelta(days=7)
+        return next_monday.strftime("%Y-%m-%d")
 
     # ============================================
     # メッセージテンプレート（v2.1 新規）
