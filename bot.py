@@ -57,6 +57,15 @@ class ShinchokuBot(commands.Bot):
         self._ready_count = 0  # 同時起動検知用
 
     async def setup_hook(self):
+        """
+        Bot起動時に一度だけ実行される初期化処理。
+
+        【実務的な設計意図】
+        古い discord.py では `on_ready` イベント内で初期化処理（DB接続等）を
+        行うことがありましたが、`on_ready` は通信切断後の再接続時にも何度も呼ばれます。
+        `setup_hook` は「Bot起動時に一度だけ確実に呼ばれる」ことが保証されているため、
+        DB接続やスケジューラの起動などの初期化処理は必ずここに書くのが現在のベストプラクティスです。
+        """
         logger.info("=== setup_hook 開始 ===")
         self.tree.on_error = self.on_app_command_error
 
@@ -190,16 +199,18 @@ class ShinchokuBot(commands.Bot):
                 logger.info("⚡ 週次サマリー漏れ検知！ 自動投稿します")
                 await summary_cog.post_weekly_summary()
 
-    async def notify_leader_error(self, context: str, error: Exception, tb: str = None):
+    async def notify_leader_error(self, context: str, error: Exception):
         """
         エラー発生時にリーダーのDMに詳細を通知する。
 
         Args:
             context: エラー発生箇所の説明（例: "クエスト配信"）
             error: 発生した例外
-            tb: トレースバック情報
         """
         try:
+            import traceback
+            tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            
             if self.sheets:
                 leader = self.sheets.get_leader()
                 if leader:
@@ -213,9 +224,8 @@ class ShinchokuBot(commands.Bot):
                         error_text = str(error)[:1000]
                         embed.add_field(name="📋 エラー概要", value=f"```{error_text}```", inline=False)
                         
-                        if tb:
-                            tb_text = tb[-1000:] # 末尾のスタックトレースのみ抽出
-                            embed.add_field(name="🔍 トレースバック (末尾)", value=f"```{tb_text}```", inline=False)
+                        tb_text = tb[-1000:] # 末尾のスタックトレースのみ抽出
+                        embed.add_field(name="🔍 トレースバック (末尾)", value=f"```{tb_text}```", inline=False)
                             
                         embed.add_field(
                             name="💡 対処方法",
@@ -223,6 +233,9 @@ class ShinchokuBot(commands.Bot):
                             inline=False,
                         )
                         embed.set_footer(text="しんちょくん 🤖 | 自動エラー検知")
+                        
+                        # utils.messaging を使ってDM送信することも可能だが、
+                        # botの根本エラー検知のため直接送信（依存を減らす）
                         await leader_user.send(embed=embed)
                         logger.info(f"📨 リーダーにエラー通知を送信: {context}")
         except Exception as notify_err:
@@ -232,11 +245,8 @@ class ShinchokuBot(commands.Bot):
         cmd_name = interaction.command.name if interaction.command else "UI操作等"
         logger.error(f"❌ インタラクションエラー ({cmd_name}): {error}")
         
-        import traceback
-        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
         user_info = f"{interaction.user.display_name} (ID: {interaction.user.id})"
-        
-        await self.notify_leader_error(f"操作: {cmd_name} | ユーザー: {user_info}", error, tb)
+        await self.notify_leader_error(f"操作: {cmd_name} | ユーザー: {user_info}", error)
         
         if not interaction.response.is_done():
             try:
@@ -251,9 +261,7 @@ class ShinchokuBot(commands.Bot):
 
     async def on_command_error(self, ctx, error):
         logger.error(f"❌ コマンドエラー: {error}")
-        import traceback
-        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-        await self.notify_leader_error(f"テキストコマンド: {ctx.command}", error, tb)
+        await self.notify_leader_error(f"テキストコマンド: {ctx.command}", error)
 
 
 def main():

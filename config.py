@@ -21,6 +21,13 @@ load_dotenv()
 # ============================================
 # Discord 設定（.env から読み込み）
 # ============================================
+# 【実務的な設計意図（セキュリティ）】
+# トークンなどの機密情報をコードに直書きし、そのままGitHubなどの
+# バージョン管理システム（Git）にコミットすると、第三者にBotを乗っ取られる
+# 危険性（インシデント）があります。
+# そのため、機密情報は必ず `.env` ファイルに分離し、Gitの管理外（.gitignore）
+# にするのが実務上の絶対的なベストプラクティスです。
+#
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 PROGRESS_CHANNEL_ID = int(os.getenv("PROGRESS_CHANNEL_ID", "0"))
@@ -38,16 +45,22 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
 # メンバー設定
 # ============================================
 # メンバーのDiscordユーザーIDを .env から読み込み
+#
+# 【学べること：内包表記】
+# `for i in range(1, 6)` を使って、1〜5までのキーと値を動的に生成しています。
+# メンバーが10人に増えた場合も、`range(1, 11)` に変えるだけで対応できます。
+#
+# 【実務的な設計意図】
+# なぜソースコード内に直接ID（直書き/ハードコード）を書かないのか？
+# → メンバーの入れ替え時にコードの修正・再デプロイが不要になるため。
+#
 MEMBER_IDS = {
-    "member_1": int(os.getenv("MEMBER_1_ID", "0")),
-    "member_2": int(os.getenv("MEMBER_2_ID", "0")),
-    "member_3": int(os.getenv("MEMBER_3_ID", "0")),
-    "member_4": int(os.getenv("MEMBER_4_ID", "0")),
-    "member_5": int(os.getenv("MEMBER_5_ID", "0")),
+    f"member_{i}": int(os.getenv(f"MEMBER_{i}_ID", "0"))
+    for i in range(1, 6)
 }
 
 # リーダーのID
-LEADER_ID = MEMBER_IDS["member_4"]
+LEADER_ID = MEMBER_IDS.get("member_4", 0)
 
 # 全メンバーIDのリスト（0は未設定なので除外）
 def get_active_member_ids():
