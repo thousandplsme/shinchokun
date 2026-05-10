@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ext import commands
+from discord import app_commands
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
