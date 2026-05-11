@@ -207,8 +207,8 @@ class SendQuestSelectView(discord.ui.View):
         self.add_item(self.user_select)
 
     async def user_callback(self, interaction: discord.Interaction):
-        target_id = int(self.user_select.values[0])
-        target = self.bot.get_user(target_id) or await self.bot.fetch_user(target_id)
+        target = self.user_select.values[0]
+        target_id = target.id
         
         await interaction.response.defer(ephemeral=True)
         quest_cog = self.bot.get_cog("QuestCog")
@@ -519,7 +519,7 @@ class ResetSentUserSelectView(discord.ui.View):
         self.add_item(self.user_select)
 
     async def user_callback(self, interaction: discord.Interaction):
-        target_id = int(self.user_select.values[0])
+        target_id = self.user_select.values[0].id
         await interaction.response.defer(ephemeral=True)
         
         sheets = self.bot.sheets
@@ -572,7 +572,7 @@ class FixStatusUserSelectView(discord.ui.View):
         self.add_item(self.user_select)
 
     async def user_callback(self, interaction: discord.Interaction):
-        target_id = int(self.user_select.values[0])
+        target_id = self.user_select.values[0].id
         await interaction.response.defer(ephemeral=True)
         
         sheets = self.bot.sheets
