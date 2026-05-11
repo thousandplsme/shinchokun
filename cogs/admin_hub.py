@@ -351,11 +351,16 @@ class AdminSyncSelectView(discord.ui.View):
     @discord.ui.button(label="EXP同期", style=discord.ButtonStyle.primary)
     async def sync_exp_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
         try:
-            logs = await self.bot.db.get_all_exp_logs()
+            logs = await sheets.get_all_exp_logs()
         except Exception as e:
-            logger.error(f"❌ EXPログ取得エラー: {e}")
-            await interaction.followup.send("⚠️ ログの取得に失敗しました。", ephemeral=True)
+            logger.error(f"❌ EXPログ(Sheets)取得エラー: {e}")
+            await interaction.followup.send("⚠️ スプレッドシートからのログ取得に失敗しました。", ephemeral=True)
             return
 
         if not logs:
@@ -420,14 +425,91 @@ class AdminSyncSelectView(discord.ui.View):
             results.append(f"**{name}**: {old_exp} → {new_exp} ({diff_str})")
 
         embed = discord.Embed(
-            title="🔄 EXP同期完了",
-            description=f"EXPログ {len(logs)} 件から {len(totals)} 人分を同期しました。",
+            title="🔄 EXP同期(Sheets基準)完了",
+            description=f"スプレッドシートのログ {len(logs)} 件に基づき同期しました。",
             color=config.COLOR_SUCCESS,
         )
         embed.add_field(name="📊 同期結果", value="\n".join(results) or "なし", inline=False)
         embed.set_footer(text="しんちょくん 🤖 | EXP同期")
         await interaction.followup.send(embed=embed, ephemeral=True)
-        logger.info(f"🔄 EXP同期完了: {len(totals)}人")
+        logger.info(f"🔄 EXP同期(Sheets)完了: {len(totals)}人")
+
+    @discord.ui.button(label="クエスト同期", style=discord.ButtonStyle.primary)
+    async def sync_quests_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
+        try:
+            week_start = sheets.get_current_week_start()
+            all_quests = await sheets.get_weekly_quests(week_start)
+            
+            success_count = 0
+            for q in all_quests:
+                if q.get("status") == "完了":
+                    # DBに記録（既にある場合は無視される）
+                    res = await self.bot.db.record_quest_completion(
+                        discord_id=q["discord_id"],
+                        week_start=q["week_start"],
+                        quest_title=q["quest_title"],
+                        exp_earned=q.get("exp_reward", 0)
+                    )
+                    if res: success_count += 1
+            
+            embed = discord.Embed(
+                title="🔄 クエスト状況同期完了",
+                description=f"スプレッドシートの「完了」ステータスをDBに反映しました。\n新規同期: **{success_count}** 件",
+                color=config.COLOR_SUCCESS,
+            )
+            embed.set_footer(text="しんちょくん 🤖 | クエスト同期")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"🔄 クエスト状況同期(Sheets->DB): {success_count}件反映")
+            
+        except Exception as e:
+            logger.error(f"❌ クエスト同期エラー: {e}")
+            await interaction.followup.send(f"⚠️ 同期に失敗しました: {e}", ephemeral=True)
+
+    @discord.ui.button(label="EXPバックアップ", style=discord.ButtonStyle.secondary)
+    async def backup_exp_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """DBのEXPログをスプレッドシートに書き出す（DB -> Sheets）"""
+        await interaction.response.defer(ephemeral=True)
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
+        try:
+            db_logs = await self.bot.db.get_all_exp_logs()
+            sheet_logs = await sheets.get_all_exp_logs()
+            
+            # 既にシートにあるログをセット化して重複チェック（簡易版）
+            existing_keys = set()
+            for sl in sheet_logs:
+                # 秒以下の精度やフォーマットの違いを考慮しつつキーを作成
+                key = f"{sl['discord_id']}_{sl['amount']}_{sl['reason']}"
+                existing_keys.add(key)
+            
+            new_count = 0
+            for dl in db_logs:
+                key = f"{dl['discord_id']}_{dl['amount']}_{dl['reason']}"
+                if key not in existing_keys:
+                    await sheets.append_exp_log(dl["discord_id"], dl["amount"], dl["reason"])
+                    new_count += 1
+            
+            embed = discord.Embed(
+                title="💾 EXPバックアップ完了",
+                description=f"DBにのみ存在するEXPログをスプレッドシートに書き出しました。\n新規追加: **{new_count}** 件",
+                color=config.COLOR_SUCCESS,
+            )
+            embed.set_footer(text="しんちょくん 🤖 | EXPバックアップ")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"💾 EXPバックアップ(DB->Sheets): {new_count}件追加")
+            
+        except Exception as e:
+            logger.error(f"❌ EXPバックアップエラー: {e}")
+            await interaction.followup.send(f"⚠️ バックアップに失敗しました: {e}", ephemeral=True)
 
     @discord.ui.button(label="ロール同期", style=discord.ButtonStyle.primary)
     async def sync_roles_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -438,72 +520,79 @@ class AdminSyncSelectView(discord.ui.View):
             await interaction.followup.send("⚠️ サーバー内で実行してください。", ephemeral=True)
             return
 
-        exp_manager = ExpManager(self.bot.db, getattr(self.bot, "sheets", None))
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
+        # 1. スプレッドシートから最新の累計EXPを算出
+        try:
+            logs = await sheets.get_all_exp_logs()
+            totals = {}
+            for log in logs:
+                uid = log["discord_id"]
+                totals[uid] = totals.get(uid, 0) + log["amount"]
+        except Exception as e:
+            logger.error(f"❌ ロール同期中のEXP取得失敗: {e}")
+            await interaction.followup.send(f"⚠️ データ取得に失敗しました: {e}", ephemeral=True)
+            return
+
+        exp_manager = ExpManager(self.bot.db, sheets)
         member_ids = config.get_active_member_ids()
         success = 0
         errors = []
 
         for uid in member_ids:
             try:
+                # 最新EXPからレベルと称号を確定
+                new_exp = totals.get(uid, 0)
+                new_level = TitleSystem.calculate_level(new_exp)
+                
+                # DBプロフィールを最新化（または作成）
                 profile = await exp_manager.ensure_profile(uid, guild=guild)
-                level = profile["level"]
-
                 job_type = profile.get("job_type", "")
-                if not job_type and getattr(self.bot, "sheets", None):
-                    member_info = self.bot.sheets.get_member(uid)
+                if not job_type:
+                    member_info = sheets.get_member(uid)
                     if member_info:
                         job_type = member_info.get("job_type", "")
-                job_name = self.bot.sheets.get_job_name(job_type) if getattr(self.bot, "sheets", None) else job_type
-                title = TitleSystem.get_title(level, job_name)
+                
+                job_name = sheets.get_job_name(job_type) or job_type
+                title = TitleSystem.get_title(new_level, job_name)
 
-                if title != profile["current_title"]:
-                    logger.info(f"🔧 称号修復: ID={uid}, '{profile['current_title']}' → '{title}'")
-                    await self.bot.db.upsert_user_profile(
-                        discord_id=uid, total_exp=profile["total_exp"], level=level,
-                        job_type=job_type, current_title=title,
-                        consecutive_weeks=profile.get("consecutive_weeks", 0),
-                    )
+                # DB更新
+                await self.bot.db.upsert_user_profile(
+                    discord_id=uid, total_exp=new_exp, level=new_level,
+                    job_type=job_type, current_title=title,
+                    consecutive_weeks=profile.get("consecutive_weeks", 0),
+                )
 
-                if not title or not title.strip():
-                    continue
-
-                role = discord.utils.get(guild.roles, name=title)
-                if role is None:
-                    rank = TitleSystem.get_title_rank(level)
-                    color = discord.Color(config.ROLE_COLORS.get(rank, 0x95A5A6))
-                    role = await guild.create_role(
-                        name=title, color=color,
-                        reason="しんちょくん: 称号ロール一括作成",
-                    )
-                    logger.info(f"✨ ロール作成: {title}")
-
-                member = guild.get_member(uid)
-                if member is None:
-                    member = await guild.fetch_member(uid)
-                if role not in member.roles:
-                    await member.add_roles(role, reason="称号ロール一括同期")
+                # ロール付与
+                if title:
+                    role = discord.utils.get(guild.roles, name=title)
+                    if role is None:
+                        rank = TitleSystem.get_title_rank(new_level)
+                        color = discord.Color(config.ROLE_COLORS.get(rank, 0x95A5A6))
+                        role = await guild.create_role(name=title, color=color, reason="称号ロール一括作成")
+                    
+                    member = guild.get_member(uid) or await guild.fetch_member(uid)
+                    if role not in member.roles:
+                        await member.add_roles(role, reason="称号ロール同期(Sheets基準)")
 
                 success += 1
-                user = self.bot.get_user(uid)
-                logger.info(f"🏅 ロール同期: {user.display_name if user else uid} → {title}")
+                logger.info(f"🏅 ロール同期(Sheets基準): {uid} → {title} (EXP:{new_exp})")
 
-            except discord.NotFound:
-                errors.append(f"ID:{uid} — メンバーが見つかりません")
-            except discord.Forbidden:
-                errors.append(f"ID:{uid} — 権限不足")
             except Exception as e:
                 errors.append(f"ID:{uid} — {e}")
 
         embed = discord.Embed(
             title="🏅 ロール同期完了",
-            description=f"**{success}/{len(member_ids)}** 人にロールを付与しました。",
+            description=f"スプレッドシートのEXPに基づき、**{success}/{len(member_ids)}** 人のロールを同期しました。",
             color=config.COLOR_SUCCESS if not errors else config.COLOR_WARNING,
         )
         if errors:
             embed.add_field(name="⚠️ エラー", value="\n".join(errors[:5]), inline=False)
         embed.set_footer(text="しんちょくん 🤖 | ロール同期")
         await interaction.followup.send(embed=embed, ephemeral=True)
-        logger.info(f"🏅 ロール同期完了: {success}/{len(member_ids)}人")
 
 
 # ============================================
