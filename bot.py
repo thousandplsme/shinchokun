@@ -98,8 +98,10 @@ class ShinchokuBot(commands.Bot):
         # 4. 永続View登録（v2.1: Hub + Quest）
         from cogs.quest import QuestView
         from cogs.hub import PersistentHubView
+        from cogs.admin_hub import AdminHubView
         self.add_view(QuestView(self))
         self.add_view(PersistentHubView(self))
+        self.add_view(AdminHubView(self))
         logger.info("✅ 永続View登録完了")
 
         # 5. スラッシュコマンド同期

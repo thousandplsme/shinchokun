@@ -247,8 +247,9 @@ class SendQuestSelectView(discord.ui.View):
             
             await target.send(embed=embed, view=view)
             
-            for q in user_quests:
-                await sheets.update_quest_sent_status(week_start, target_id, q["quest_title"], True)
+            # 送信成功したクエストの sent フラグを TRUE に一括更新
+            titles = [q["quest_title"] for q in user_quests]
+            await sheets.update_quest_sent_status_bulk(week_start, target_id, titles, True)
                 
             await interaction.followup.send(f"✅ {target.display_name} さんに {len(user_quests)}件 のクエストを追加配信しました！", ephemeral=True)
             logger.info(f"📩 追加クエスト配信: {target.name} ({len(user_quests)}件)")
@@ -274,6 +275,19 @@ class AdminHubView(discord.ui.View):
             await interaction.response.send_message("⚠️ この操作は管理者専用です。", ephemeral=True)
             return False
         return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.error(f"❌ AdminHubView Error: {error}", exc_info=True)
+        if self.bot:
+            await self.bot.notify_leader_error("AdminHubView 操作", error)
+        
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ 予期せぬエラーが発生しました。リーダーに通知されました。", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ 予期せぬエラーが発生しました。リーダーに通知されました。", ephemeral=True)
+        except Exception:
+            pass
 
     @discord.ui.button(label="🏅 隠し称号の付与", style=discord.ButtonStyle.success, custom_id="admin_hub_title", row=0)
     async def hidden_title_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -312,17 +326,21 @@ class AdminHubView(discord.ui.View):
     @discord.ui.button(label="🔄 データ同期", style=discord.ButtonStyle.danger, custom_id="admin_hub_sync", row=1)
     async def sync_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check_admin(interaction): return
-        commands_cog = self.bot.get_cog("CommandsCog")
-        if commands_cog:
-            await interaction.response.send_message("⏳ データ同期（EXP・ロール）を実行中...", ephemeral=True)
-            # sync_exp の呼び出し（Interactionを直接渡すと重複応答エラーになるため、内部で処理を分けるかラップするべきですが、簡単のため直接コールバック呼び出し）
-            # sync_exp / sync_roles は内部で followup/response.send を呼ぶため、一括ボタンにする場合は注意が必要。
-            # ここでは別々に選べる View を返す方が安全です。
-            
-            view = AdminSyncSelectView(self.bot)
-            await interaction.edit_original_response(content="🔄 同期する項目を選択してください", view=view)
-        else:
-            await interaction.response.send_message("⚠️ CommandsCogが読み込まれていません。", ephemeral=True)
+        await interaction.response.send_message("⏳ 同期・リセットする項目を選択してください", ephemeral=True)
+        view = AdminSyncSelectView(self.bot)
+        await interaction.edit_original_response(view=view)
+
+    @discord.ui.button(label="🧹 配信状況リセット", style=discord.ButtonStyle.secondary, custom_id="admin_hub_reset_sent", row=1)
+    async def reset_sent_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_admin(interaction): return
+        view = ResetSentUserSelectView(self.bot)
+        await interaction.response.send_message("🧹 **配信状況のリセット**\nリセットしたいメンバーを選択してください。", view=view, ephemeral=True)
+
+    @discord.ui.button(label="✏️ ステータス手動修正", style=discord.ButtonStyle.secondary, custom_id="admin_hub_fix_status", row=1)
+    async def fix_status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_admin(interaction): return
+        view = FixStatusUserSelectView(self.bot)
+        await interaction.response.send_message("✏️ **ステータスの手動修正**\n修正したいメンバーを選択してください。", view=view, ephemeral=True)
 
 
 class AdminSyncSelectView(discord.ui.View):
@@ -486,6 +504,146 @@ class AdminSyncSelectView(discord.ui.View):
         embed.set_footer(text="しんちょくん 🤖 | ロール同期")
         await interaction.followup.send(embed=embed, ephemeral=True)
         logger.info(f"🏅 ロール同期完了: {success}/{len(member_ids)}人")
+
+
+# ============================================
+# クエスト配信状況リセット UI
+# ============================================
+
+class ResetSentUserSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.user_select = discord.ui.UserSelect(placeholder="リセットするメンバーを選択...")
+        self.user_select.callback = self.user_callback
+        self.add_item(self.user_select)
+
+    async def user_callback(self, interaction: discord.Interaction):
+        target_id = int(self.user_select.values[0])
+        await interaction.response.defer(ephemeral=True)
+        
+        sheets = self.bot.sheets
+        if not sheets: return
+        
+        week_start = sheets.get_current_week_start()
+        quests = await sheets.get_weekly_quests(week_start)
+        user_quests = [q for q in quests if q["discord_id"] == target_id and q.get("sent", False)]
+        
+        if not user_quests:
+            await interaction.followup.send("✅ 送信済みのクエストはありません。", ephemeral=True)
+            return
+
+        view = ResetSentQuestSelectView(self.bot, target_id, user_quests, week_start)
+        await interaction.followup.send(f"🧹 リセットするクエストを選択してください（{len(user_quests)}件）", view=view, ephemeral=True)
+
+class ResetSentQuestSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, target_id: int, quests: list[dict], week_start: str):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.target_id = target_id
+        self.week_start = week_start
+        
+        options = [
+            discord.SelectOption(label=q["quest_title"][:100], value=q["quest_title"])
+            for q in quests
+        ]
+        self.select = discord.ui.Select(placeholder="クエストを選択...", options=options, min_values=1, max_values=len(options))
+        self.select.callback = self.select_callback
+        self.add_item(self.select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        titles = self.select.values
+        
+        try:
+            await self.bot.sheets.update_quest_sent_status_bulk(self.week_start, self.target_id, titles, False)
+            await interaction.followup.send(f"✅ {len(titles)}件 のクエスト配信状況をリセットしました（再配信可能になりました）。", ephemeral=True)
+        except Exception as e:
+            logger.error(f"❌ 配信状況リセットエラー: {e}")
+            await interaction.followup.send(f"❌ リセットに失敗しました:\n```{e}```", ephemeral=True)
+
+
+class FixStatusUserSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.user_select = discord.ui.UserSelect(placeholder="修正するメンバーを選択...")
+        self.user_select.callback = self.user_callback
+        self.add_item(self.user_select)
+
+    async def user_callback(self, interaction: discord.Interaction):
+        target_id = int(self.user_select.values[0])
+        await interaction.response.defer(ephemeral=True)
+        
+        sheets = self.bot.sheets
+        if not sheets: return
+        
+        week_start = sheets.get_current_week_start()
+        quests = await sheets.get_weekly_quests(week_start)
+        user_quests = [q for q in quests if q["discord_id"] == target_id]
+        
+        if not user_quests:
+            await interaction.followup.send("✅ 該当するクエストはありません。", ephemeral=True)
+            return
+
+        view = FixStatusQuestSelectView(self.bot, target_id, user_quests, week_start)
+        await interaction.followup.send(f"✏️ 修正するクエストを選択してください（{len(user_quests)}件）", view=view, ephemeral=True)
+
+class FixStatusQuestSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, target_id: int, quests: list[dict], week_start: str):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.target_id = target_id
+        self.week_start = week_start
+        
+        options = [
+            discord.SelectOption(label=f"{q['quest_title'][:50]} ({q['status']})", value=q["quest_title"])
+            for q in quests
+        ]
+        self.select = discord.ui.Select(placeholder="クエストを選択...", options=options)
+        self.select.callback = self.select_callback
+        self.add_item(self.select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        title = self.select.values[0]
+        view = FixStatusActionView(self.bot, self.target_id, title, self.week_start)
+        await interaction.response.send_message(f"🛠️ 『{title}』の新しいステータスを選択してください。", view=view, ephemeral=True)
+
+class FixStatusActionView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, target_id: int, title: str, week_start: str):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.target_id = target_id
+        self.title = title
+        self.week_start = week_start
+
+    @discord.ui.button(label="未着手", style=discord.ButtonStyle.secondary)
+    async def status_todo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "未着手")
+
+    @discord.ui.button(label="進行中", style=discord.ButtonStyle.primary)
+    async def status_doing(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "進行中")
+
+    @discord.ui.button(label="完了", style=discord.ButtonStyle.success)
+    async def status_done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "完了")
+
+    @discord.ui.button(label="延長", style=discord.ButtonStyle.secondary)
+    async def status_extend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "延長")
+
+    @discord.ui.button(label="辞退", style=discord.ButtonStyle.danger)
+    async def status_decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "辞退")
+
+    async def _update(self, interaction: discord.Interaction, status: str):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self.bot.sheets.update_quest_status(self.week_start, self.target_id, self.title, status)
+            await interaction.followup.send(f"✅ 『{self.title}』のステータスを **{status}** に変更しました。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 更新失敗: {e}", ephemeral=True)
 
 
 # ============================================

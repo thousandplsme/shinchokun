@@ -564,12 +564,12 @@ class QuestCog(commands.Cog):
                 async with dm_limiter:
                     await user.send(embed=embed, view=view)
 
-                # 送信成功したクエストの sent フラグを TRUE に更新
-                for q in user_quests:
-                    try:
-                        await sheets.update_quest_sent_status(week_start, uid, q["quest_title"], True)
-                    except Exception as e:
-                        logger.error(f"⚠️ sentフラグ更新失敗: {q['quest_title']} - {e}")
+                # 送信成功したクエストの sent フラグを TRUE に一括更新
+                try:
+                    titles = [q["quest_title"] for q in user_quests]
+                    await sheets.update_quest_sent_status_bulk(week_start, uid, titles, True)
+                except Exception as e:
+                    logger.error(f"⚠️ sentフラグ一括更新失敗: {uid} - {e}")
 
                 sent_count += 1
                 logger.info(f"📩 クエスト配信: {user.name} ({len(user_quests)}件)")
