@@ -14,9 +14,16 @@ v2 で追加されたテーブル:
 - UPSERT（INSERT ... ON CONFLICT DO UPDATE）パターン
 - 非同期コンテキストマネージャー（async with）
 - 日付文字列の扱いと比較
+- DAO（Data Access Object）パターンによるデータアクセスの抽象化
+
+【実務的な設計意図（DAOパターン）】
+このファイルは「データベースとのやり取り」だけに責務を限定しています。
+Bot本体（bot.py）やCog（quest.pyなど）は、SQLの存在すら知らずにデータを扱えます。
+この分離により、将来SQLiteからPostgreSQLに移行する場合も、このファイルだけ書き換えれば済みます。
 """
 
 import os
+import logging
 import aiosqlite
 from datetime import datetime, timedelta, timezone
 
@@ -178,6 +185,8 @@ CREATE TABLE IF NOT EXISTS task_requests (
 );
 """
 
+logger = logging.getLogger(__name__)
+
 
 class Database:
     """
@@ -188,6 +197,12 @@ class Database:
       接続はメソッドごとに開閉する（コネクションプーリングは不要な規模）。
     - aiosqlite は SQLite のファイルロックを自動管理するため、
       並行書き込みも安全（ただし書き込み性能はRDBMSに劣る）。
+
+    【学べること：ヘルパーメソッドによるボイラープレート削減】
+    _execute / _fetch_one / _fetch_all / _fetch_scalar の4つの共通メソッドを用意し、
+    各メソッドで繰り返されていた「DB接続 → クエリ実行 → 結果取得 → 接続クローズ」の
+    定型コード（ボイラープレート）を一箇所に集約しています。
+    これにより、接続の閉じ忘れやエラーハンドリング漏れを構造的に防止できます。
     """
 
     def __init__(self, db_path="data/progress.db"):
@@ -201,29 +216,75 @@ class Database:
             await db.commit()
 
     # ============================================
+    # 共通ヘルパーメソッド（ボイラープレート削減）
+    # ============================================
+    #
+    # 【実務的な設計意図】
+    # 約30箇所で繰り返されていた「DB接続→実行→コミット→クローズ」のパターンを
+    # 4つのメソッドに集約。修正が必要になった場合（例: ログ追加、タイムアウト設定）、
+    # ここだけ直せば全てのDB操作に反映されます。
+    #
+
+    async def _execute(self, sql: str, params: tuple = ()) -> int:
+        """
+        INSERT / UPDATE / DELETE を実行し、lastrowid を返す。
+        自動的にコミットと接続クローズを行う。
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(sql, params)
+            await db.commit()
+            return cursor.lastrowid
+
+    async def _fetch_one(self, sql: str, params: tuple = ()) -> dict | None:
+        """
+        SELECT を実行し、1行を辞書として返す。該当なしの場合は None。
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def _fetch_all(self, sql: str, params: tuple = ()) -> list[dict]:
+        """
+        SELECT を実行し、全行をリスト[辞書]として返す。
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+    async def _fetch_scalar(self, sql: str, params: tuple = ()):
+        """
+        SELECT を実行し、最初の行の最初の列の値を返す（COUNT, SUM 等の集約関数用）。
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(sql, params) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else None
+
+
+    # ============================================
     # スケジュールラウンド操作（v1 互換）
     # ============================================
 
     async def create_schedule_round(self, schedule_date: str, message_id: int, channel_id: int):
         """新しいスケジュールラウンドを作成"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """INSERT OR REPLACE INTO schedule_rounds 
-                   (schedule_date, message_id, channel_id, created_at)
-                   VALUES (?, ?, ?, ?)""",
-                (schedule_date, message_id, channel_id, now_jst().isoformat()),
-            )
-            await db.commit()
+        await self._execute(
+            """INSERT OR REPLACE INTO schedule_rounds 
+               (schedule_date, message_id, channel_id, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (schedule_date, message_id, channel_id, now_jst().isoformat()),
+        )
 
     async def get_latest_schedule_date(self) -> str | None:
         """最新のスケジュール日付を取得"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT schedule_date FROM schedule_rounds ORDER BY schedule_date DESC LIMIT 1"
-            ) as cursor:
-                row = await cursor.fetchone()
-                return row["schedule_date"] if row else None
+        row = await self._fetch_one(
+            "SELECT schedule_date FROM schedule_rounds ORDER BY schedule_date DESC LIMIT 1"
+        )
+        return row["schedule_date"] if row else None
+
 
     # ============================================
     # 進捗レポート操作（v1 互換 — 過去データ参照用）
@@ -268,96 +329,70 @@ class Database:
 
     async def get_reports_for_schedule(self, schedule_date: str) -> list[dict]:
         """指定スケジュール日のレポートを全件取得"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM progress_reports WHERE schedule_date = ? ORDER BY created_at",
-                (schedule_date,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        return await self._fetch_all(
+            "SELECT * FROM progress_reports WHERE schedule_date = ? ORDER BY created_at",
+            (schedule_date,),
+        )
 
     async def get_reported_user_ids(self, schedule_date: str) -> list[int]:
         """指定スケジュール日に報告済みのユーザーIDリストを取得"""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT user_id FROM progress_reports WHERE schedule_date = ?",
-                (schedule_date,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [row[0] for row in rows]
+        rows = await self._fetch_all(
+            "SELECT user_id FROM progress_reports WHERE schedule_date = ?",
+            (schedule_date,),
+        )
+        return [row["user_id"] for row in rows]
 
     async def get_user_latest_report(self, user_id: int) -> dict | None:
         """ユーザーの最新レポートを取得"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM progress_reports WHERE user_id = ? ORDER BY schedule_date DESC LIMIT 1",
-                (user_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self._fetch_one(
+            "SELECT * FROM progress_reports WHERE user_id = ? ORDER BY schedule_date DESC LIMIT 1",
+            (user_id,),
+        )
 
     async def get_user_reports(self, user_id: int, weeks: int = 4) -> list[dict]:
         """ユーザーの過去N週間のレポートを取得"""
         cutoff = (now_jst() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM progress_reports WHERE user_id = ? AND schedule_date >= ? ORDER BY schedule_date DESC",
-                (user_id, cutoff),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        return await self._fetch_all(
+            "SELECT * FROM progress_reports WHERE user_id = ? AND schedule_date >= ? ORDER BY schedule_date DESC",
+            (user_id, cutoff),
+        )
 
     async def get_all_reports_since(self, weeks: int = 4) -> list[dict]:
         """全メンバーの過去N週間のレポートを取得"""
         cutoff = (now_jst() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM progress_reports WHERE schedule_date >= ? ORDER BY schedule_date DESC, user_id",
-                (cutoff,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        return await self._fetch_all(
+            "SELECT * FROM progress_reports WHERE schedule_date >= ? ORDER BY schedule_date DESC, user_id",
+            (cutoff,),
+        )
 
     async def get_weekly_report_count(self, user_id: int, weeks: int = 4) -> dict:
         """ユーザーの過去N週間の報告率を計算"""
         cutoff = (now_jst() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM schedule_rounds WHERE schedule_date >= ?",
-                (cutoff,),
-            ) as cursor:
-                total = (await cursor.fetchone())[0]
-
-            async with db.execute(
-                "SELECT COUNT(*) FROM progress_reports WHERE user_id = ? AND schedule_date >= ?",
-                (user_id, cutoff),
-            ) as cursor:
-                reported = (await cursor.fetchone())[0]
-
-            return {
-                "total": total,
-                "reported": reported,
-                "rate": (reported / total * 100) if total > 0 else 0,
-            }
+        total = await self._fetch_scalar(
+            "SELECT COUNT(*) FROM schedule_rounds WHERE schedule_date >= ?",
+            (cutoff,),
+        )
+        reported = await self._fetch_scalar(
+            "SELECT COUNT(*) FROM progress_reports WHERE user_id = ? AND schedule_date >= ?",
+            (user_id, cutoff),
+        )
+        return {
+            "total": total or 0,
+            "reported": reported or 0,
+            "rate": (reported / total * 100) if total and total > 0 else 0,
+        }
 
     async def get_motivation_history(self, weeks: int = 8) -> list[dict]:
         """全メンバーのモチベーション履歴を取得（グラフ用）"""
         cutoff = (now_jst() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """SELECT user_id, schedule_date, motivation 
-                   FROM progress_reports 
-                   WHERE schedule_date >= ? AND is_no_progress = 0
-                   ORDER BY schedule_date""",
-                (cutoff,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        return await self._fetch_all(
+            """SELECT user_id, schedule_date, motivation 
+               FROM progress_reports 
+               WHERE schedule_date >= ? AND is_no_progress = 0
+               ORDER BY schedule_date""",
+            (cutoff,),
+        )
+
 
     # ============================================
     # ユーザープロフィール操作（v2 新規）
@@ -375,14 +410,10 @@ class Database:
         Returns:
             プロフィール辞書 or None（未登録の場合）
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM user_profiles WHERE discord_id = ?",
-                (discord_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self._fetch_one(
+            "SELECT * FROM user_profiles WHERE discord_id = ?",
+            (discord_id,),
+        )
 
     async def upsert_user_profile(
         self,
@@ -400,34 +431,28 @@ class Database:
         discord_id が既に存在する場合は UPDATE を実行。
         excluded.* は INSERT で指定した値を参照する。
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """INSERT INTO user_profiles 
-                   (discord_id, total_exp, level, job_type, current_title, consecutive_weeks, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(discord_id) DO UPDATE SET
-                       total_exp=excluded.total_exp,
-                       level=excluded.level,
-                       job_type=excluded.job_type,
-                       current_title=excluded.current_title,
-                       consecutive_weeks=excluded.consecutive_weeks,
-                       updated_at=excluded.updated_at""",
-                (
-                    discord_id, total_exp, level, job_type, current_title,
-                    consecutive_weeks, now_jst().isoformat(),
-                ),
-            )
-            await db.commit()
+        await self._execute(
+            """INSERT INTO user_profiles 
+               (discord_id, total_exp, level, job_type, current_title, consecutive_weeks, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(discord_id) DO UPDATE SET
+                   total_exp=excluded.total_exp,
+                   level=excluded.level,
+                   job_type=excluded.job_type,
+                   current_title=excluded.current_title,
+                   consecutive_weeks=excluded.consecutive_weeks,
+                   updated_at=excluded.updated_at""",
+            (
+                discord_id, total_exp, level, job_type, current_title,
+                consecutive_weeks, now_jst().isoformat(),
+            ),
+        )
 
     async def get_all_user_profiles(self) -> list[dict]:
         """全ユーザーのプロフィールを取得する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM user_profiles ORDER BY total_exp DESC"
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        return await self._fetch_all(
+            "SELECT * FROM user_profiles ORDER BY total_exp DESC"
+        )
 
     # ============================================
     # EXP記録操作（v2 新規）
@@ -440,13 +465,11 @@ class Database:
         これは「履歴」テーブルへの追記。
         累計EXPの更新は user_profiles テーブルで別途行う。
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """INSERT INTO exp_records (discord_id, amount, reason, created_at)
-                   VALUES (?, ?, ?, ?)""",
-                (discord_id, amount, reason, now_jst().isoformat()),
-            )
-            await db.commit()
+        await self._execute(
+            """INSERT INTO exp_records (discord_id, amount, reason, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (discord_id, amount, reason, now_jst().isoformat()),
+        )
 
     async def get_weekly_exp(self, discord_id: int, week_start: str) -> int:
         """
@@ -458,15 +481,12 @@ class Database:
         """
         week_end_date = datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=7)
         week_end = week_end_date.strftime("%Y-%m-%d")
-
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                """SELECT COALESCE(SUM(amount), 0) FROM exp_records 
-                   WHERE discord_id = ? AND created_at >= ? AND created_at < ?""",
-                (discord_id, week_start, week_end),
-            ) as cursor:
-                result = await cursor.fetchone()
-                return result[0]
+        result = await self._fetch_scalar(
+            """SELECT COALESCE(SUM(amount), 0) FROM exp_records 
+               WHERE discord_id = ? AND created_at >= ? AND created_at < ?""",
+            (discord_id, week_start, week_end),
+        )
+        return result or 0
 
     async def get_all_weekly_exp(self, week_start: str) -> list[dict]:
         """
@@ -478,19 +498,15 @@ class Database:
         """
         week_end_date = datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=7)
         week_end = week_end_date.strftime("%Y-%m-%d")
+        return await self._fetch_all(
+            """SELECT discord_id, SUM(amount) as weekly_exp 
+               FROM exp_records 
+               WHERE created_at >= ? AND created_at < ?
+               GROUP BY discord_id 
+               ORDER BY weekly_exp DESC""",
+            (week_start, week_end),
+        )
 
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """SELECT discord_id, SUM(amount) as weekly_exp 
-                   FROM exp_records 
-                   WHERE created_at >= ? AND created_at < ?
-                   GROUP BY discord_id 
-                   ORDER BY weekly_exp DESC""",
-                (week_start, week_end),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
 
     async def get_all_exp_logs(self) -> list[dict]:
         """全てのEXP獲得記録を取得する（データ同期用）"""
@@ -537,29 +553,21 @@ class Database:
 
     async def get_quest_completions(self, discord_id: int, week_start: str) -> list[dict]:
         """指定ユーザーの指定週のクエスト完了一覧を取得する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """SELECT * FROM quest_completions 
-                   WHERE discord_id = ? AND week_start = ?
-                   ORDER BY completed_at""",
-                (discord_id, week_start),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        return await self._fetch_all(
+            """SELECT * FROM quest_completions 
+               WHERE discord_id = ? AND week_start = ?
+               ORDER BY completed_at""",
+            (discord_id, week_start),
+        )
 
     async def get_all_quest_completions_for_week(self, week_start: str) -> list[dict]:
         """指定週の全メンバーのクエスト完了を取得する（サマリー用）"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """SELECT * FROM quest_completions 
-                   WHERE week_start = ? 
-                   ORDER BY discord_id, completed_at""",
-                (week_start,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        return await self._fetch_all(
+            """SELECT * FROM quest_completions 
+               WHERE week_start = ? 
+               ORDER BY discord_id, completed_at""",
+            (week_start,),
+        )
 
     # ============================================
     # SOS記録（v2 新規）
@@ -569,14 +577,12 @@ class Database:
         self, from_user_id: int, mentor_user_id: int, content: str, urgency: str = "medium"
     ):
         """SOS送信を記録する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """INSERT INTO sos_requests 
-                   (from_user_id, mentor_user_id, content, urgency, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (from_user_id, mentor_user_id, content, urgency, now_jst().isoformat()),
-            )
-            await db.commit()
+        await self._execute(
+            """INSERT INTO sos_requests 
+               (from_user_id, mentor_user_id, content, urgency, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (from_user_id, mentor_user_id, content, urgency, now_jst().isoformat()),
+        )
 
     # ============================================
     # 日程調整リクエスト（v2 新規）
@@ -593,37 +599,28 @@ class Database:
         INSERT 直後に、自動採番された PRIMARY KEY の値を取得するプロパティ。
         このIDを使って後から status を更新する。
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """INSERT INTO meeting_requests 
-                   (from_user_id, to_user_id, proposed_datetime, subject, status, created_at)
-                   VALUES (?, ?, ?, ?, 'pending', ?)""",
-                (from_user_id, to_user_id, proposed_datetime, subject, now_jst().isoformat()),
-            )
-            await db.commit()
-            return cursor.lastrowid
+        return await self._execute(
+            """INSERT INTO meeting_requests 
+               (from_user_id, to_user_id, proposed_datetime, subject, status, created_at)
+               VALUES (?, ?, ?, ?, 'pending', ?)""",
+            (from_user_id, to_user_id, proposed_datetime, subject, now_jst().isoformat()),
+        )
 
     async def update_meeting_status(self, meeting_id: int, status: str, reason: str = ""):
         """日程調整リクエストのステータスを更新する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """UPDATE meeting_requests 
-                   SET status = ?, response_reason = ? 
-                   WHERE id = ?""",
-                (status, reason, meeting_id),
-            )
-            await db.commit()
+        await self._execute(
+            """UPDATE meeting_requests 
+               SET status = ?, response_reason = ? 
+               WHERE id = ?""",
+            (status, reason, meeting_id),
+        )
 
     async def get_meeting_request(self, meeting_id: int) -> dict | None:
         """日程調整リクエストを取得する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM meeting_requests WHERE id = ?",
-                (meeting_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self._fetch_one(
+            "SELECT * FROM meeting_requests WHERE id = ?",
+            (meeting_id,),
+        )
 
     # ============================================
     # ピアボーナス操作（v2.1 新規）
@@ -633,13 +630,11 @@ class Database:
         self, from_user_id: int, to_user_id: int, message: str
     ):
         """ピアボーナスを記録する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """INSERT INTO peer_bonuses (from_user_id, to_user_id, message, created_at)
-                   VALUES (?, ?, ?, ?)""",
-                (from_user_id, to_user_id, message, now_jst().isoformat()),
-            )
-            await db.commit()
+        await self._execute(
+            """INSERT INTO peer_bonuses (from_user_id, to_user_id, message, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (from_user_id, to_user_id, message, now_jst().isoformat()),
+        )
 
     async def get_today_bonus_count(self, from_user_id: int) -> int:
         """
@@ -647,14 +642,12 @@ class Database:
         1日あたりのスパム防止用。
         """
         today = today_jst()
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                """SELECT COUNT(*) FROM peer_bonuses
-                   WHERE from_user_id = ? AND created_at LIKE ?""",
-                (from_user_id, f"{today}%"),
-            ) as cursor:
-                result = await cursor.fetchone()
-                return result[0]
+        result = await self._fetch_scalar(
+            """SELECT COUNT(*) FROM peer_bonuses
+               WHERE from_user_id = ? AND created_at LIKE ?""",
+            (from_user_id, f"{today}%"),
+        )
+        return result or 0
 
     # ============================================
     # 日程調整投票（v2.2 新規）
@@ -664,23 +657,27 @@ class Database:
         self, created_by: int, subject: str, candidates_json: str, expires_at: str
     ) -> int:
         """日程調整投票を作成し、IDを返す"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """INSERT INTO schedule_polls
-                   (created_by, subject, candidates, status, expires_at, created_at)
-                   VALUES (?, ?, ?, 'open', ?, ?)""",
-                (created_by, subject, candidates_json, expires_at, now_jst().isoformat()),
-            )
-            await db.commit()
-            return cursor.lastrowid
+        return await self._execute(
+            """INSERT INTO schedule_polls
+               (created_by, subject, candidates, status, expires_at, created_at)
+               VALUES (?, ?, ?, 'open', ?, ?)""",
+            (created_by, subject, candidates_json, expires_at, now_jst().isoformat()),
+        )
 
     async def save_schedule_vote(
         self, poll_id: int, discord_id: int, selected_json: str
     ) -> bool:
-        """投票を保存（UPSERT）。新規ならTrue、更新ならFalseを返す"""
+        """
+        投票を保存（UPSERT）。新規ならTrue、更新ならFalseを返す。
+
+        【実務的な設計意図】
+        このメソッドは「既存チェック→UPSERT」の2段階処理が必要なため、
+        共通ヘルパー（_execute）ではなく独自のDB接続を使用しています。
+        同一トランザクション内で「読み取り→書き込み」を行うことで、
+        データの整合性を保証しています。
+        """
         async with aiosqlite.connect(self.db_path) as db:
             try:
-                # 既存の投票があるかチェック
                 cursor = await db.execute(
                     "SELECT 1 FROM schedule_votes WHERE poll_id = ? AND discord_id = ?",
                     (poll_id, discord_id)
@@ -700,61 +697,45 @@ class Database:
                 return is_new
             except Exception as e:
                 logger.error(f"❌ 投票保存エラー: {e}")
-                return True # エラー時はとりあえず新規扱い（または例外スロー）
+                return True
 
     async def get_schedule_poll(self, poll_id: int) -> dict | None:
         """投票情報を取得する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM schedule_polls WHERE id = ?", (poll_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self._fetch_one(
+            "SELECT * FROM schedule_polls WHERE id = ?", (poll_id,)
+        )
 
     async def get_schedule_votes(self, poll_id: int) -> list[dict]:
         """指定投票の全回答を取得する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM schedule_votes WHERE poll_id = ? ORDER BY created_at",
-                (poll_id,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        return await self._fetch_all(
+            "SELECT * FROM schedule_votes WHERE poll_id = ? ORDER BY created_at",
+            (poll_id,),
+        )
 
     async def get_schedule_vote_count(self, poll_id: int) -> int:
         """指定投票の回答数を取得する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM schedule_votes WHERE poll_id = ?",
-                (poll_id,),
-            ) as cursor:
-                result = await cursor.fetchone()
-                return result[0]
+        result = await self._fetch_scalar(
+            "SELECT COUNT(*) FROM schedule_votes WHERE poll_id = ?",
+            (poll_id,),
+        )
+        return result or 0
 
     async def confirm_schedule_poll(self, poll_id: int, confirmed_slot: str, event_id: int = 0):
         """投票を確定状態にする"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """UPDATE schedule_polls SET status = 'confirmed',
-                   confirmed_slot = ?, event_id = ? WHERE id = ?""",
-                (confirmed_slot, event_id, poll_id),
-            )
-            await db.commit()
+        await self._execute(
+            """UPDATE schedule_polls SET status = 'confirmed',
+               confirmed_slot = ?, event_id = ? WHERE id = ?""",
+            (confirmed_slot, event_id, poll_id),
+        )
 
     async def get_open_polls(self) -> list[dict]:
         """期限切れの未確定投票を取得する（自動集計用）"""
         now = now_jst().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                """SELECT * FROM schedule_polls
-                   WHERE status = 'open' AND expires_at <= ?""",
-                (now,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        return await self._fetch_all(
+            """SELECT * FROM schedule_polls
+               WHERE status = 'open' AND expires_at <= ?""",
+            (now,),
+        )
 
     # ============================================
     # タスク申請操作（v2.2 新規）
@@ -765,34 +746,26 @@ class Database:
         requested_exp: int, week_start: str,
     ) -> int:
         """タスク申請を作成し、IDを返す"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """INSERT INTO task_requests
-                   (discord_id, quest_title, quest_detail, requested_exp, week_start, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
-                (discord_id, quest_title, quest_detail, requested_exp, week_start, now_jst().isoformat()),
-            )
-            await db.commit()
-            return cursor.lastrowid
+        return await self._execute(
+            """INSERT INTO task_requests
+               (discord_id, quest_title, quest_detail, requested_exp, week_start, status, created_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+            (discord_id, quest_title, quest_detail, requested_exp, week_start, now_jst().isoformat()),
+        )
 
     async def get_task_request(self, request_id: int) -> dict | None:
         """タスク申請を取得する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM task_requests WHERE id = ?", (request_id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self._fetch_one(
+            "SELECT * FROM task_requests WHERE id = ?", (request_id,)
+        )
 
     async def update_task_request(
         self, request_id: int, status: str, reviewer_id: int = 0, reject_reason: str = ""
     ):
         """タスク申請のステータスを更新する"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
-                """UPDATE task_requests SET status = ?, reviewer_id = ?, reject_reason = ?
-                   WHERE id = ?""",
-                (status, reviewer_id, reject_reason, request_id),
-            )
-            await db.commit()
+        await self._execute(
+            """UPDATE task_requests SET status = ?, reviewer_id = ?, reject_reason = ?
+               WHERE id = ?""",
+            (status, reviewer_id, reject_reason, request_id),
+        )
+

@@ -4,6 +4,17 @@ cogs/hub.py — 統合コマンドチャンネル（v2.1）
 SOSチャンネルを「しんちょくんコマンドチャンネル」に統合し、
 SOS・ミーティング・クエスト状況・マイルストーン・ピアボーナス・ランキングの
 全機能を1チャンネルの常設ボタンから利用可能にする。
+
+【このファイルで学べること】
+- discord.ui.Modal を用いたテキスト入力フォームの作成
+- utils.messaging.send_dm_safely を用いたDMの安全な送信
+
+【実務的な設計意図（例外処理の共通化とDRY原則）】
+Discord Botにおいて「DMの送信」は、ユーザーがDMを拒否設定している場合などに
+必ず例外（discord.Forbidden）を発生させるリスクを伴います。
+以前はこのファイル内のあらゆる箇所で都度 try-except を書いていましたが、
+send_dm_safely ヘルパーに共通化することで、コードの重複を排除し（DRY原則）、
+ログ出力やレート制限のハンドリングを一元的に管理できるように改善されています。
 """
 
 import logging
@@ -16,6 +27,7 @@ from discord import app_commands
 import config
 from rate_limiter import dm_limiter
 from gamification import ExpManager, TitleSystem
+from utils.messaging import send_dm_safely
 
 logger = logging.getLogger(__name__)
 JST = timezone(timedelta(hours=9))
@@ -61,42 +73,32 @@ class SOSModal(discord.ui.Modal, title="🆘 SOSフォーム"):
         urgency_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(urgency_key, "🟡")
 
         # メンターにDM
-        try:
-            mentor = await self.bot.fetch_user(self.mentor_id)
-            if mentor:
-                embed = discord.Embed(
-                    title="📩 SOSメッセージが届きました",
-                    description=f"**{user.display_name}** さんから相談です。",
-                    color=config.COLOR_SOS,
-                )
-                embed.add_field(name="📝 困りごと", value=content_text, inline=False)
-                embed.add_field(name=f"{urgency_emoji} 緊急度", value=urgency, inline=True)
-                embed.set_thumbnail(url=user.display_avatar.url)
-                embed.set_footer(text="しんちょくん 🤖 | SOS通知")
-                async with dm_limiter:
-                    await mentor.send(embed=embed)
-        except Exception as e:
-            logger.error(f"❌ メンターDM送信エラー: {e}")
+        if mentor := await self.bot.fetch_user(self.mentor_id):
+            embed = discord.Embed(
+                title="📩 SOSメッセージが届きました",
+                description=f"**{user.display_name}** さんから相談です。",
+                color=config.COLOR_SOS,
+            )
+            embed.add_field(name="📝 困りごと", value=content_text, inline=False)
+            embed.add_field(name=f"{urgency_emoji} 緊急度", value=urgency, inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            embed.set_footer(text="しんちょくん 🤖 | SOS通知")
+            await send_dm_safely(mentor, embed=embed)
 
         # リーダーにCc
         leader_info = self.bot.sheets.get_leader() if self.bot.sheets else None
         leader_id = leader_info["discord_id"] if leader_info else config.LEADER_ID
         if leader_id and leader_id != self.mentor_id:
-            try:
-                leader = await self.bot.fetch_user(leader_id)
-                if leader:
-                    cc_embed = discord.Embed(
-                        title="📋 SOS通知（Cc）",
-                        description=f"**{user.display_name}** さんがメンターに相談しました。",
-                        color=config.COLOR_WARNING,
-                    )
-                    cc_embed.add_field(name="📝 困りごと", value=content_text, inline=False)
-                    cc_embed.add_field(name=f"{urgency_emoji} 緊急度", value=urgency, inline=True)
-                    cc_embed.set_footer(text="しんちょくん 🤖 | Cc通知")
-                    async with dm_limiter:
-                        await leader.send(embed=cc_embed)
-            except Exception as e:
-                logger.error(f"❌ リーダーCc送信エラー: {e}")
+            if leader := await self.bot.fetch_user(leader_id):
+                cc_embed = discord.Embed(
+                    title="📋 SOS通知（Cc）",
+                    description=f"**{user.display_name}** さんがメンターに相談しました。",
+                    color=config.COLOR_WARNING,
+                )
+                cc_embed.add_field(name="📝 困りごと", value=content_text, inline=False)
+                cc_embed.add_field(name=f"{urgency_emoji} 緊急度", value=urgency, inline=True)
+                cc_embed.set_footer(text="しんちょくん 🤖 | Cc通知")
+                await send_dm_safely(leader, embed=cc_embed)
 
         # EXP +5
         try:
@@ -168,26 +170,22 @@ class MeetingModal(discord.ui.Modal, title="📅 ミーティング調整"):
             meeting_id = await self.bot.db.save_meeting_request(
                 interaction.user.id, uid, dt, subject
             )
-            try:
-                user = await self.bot.fetch_user(uid)
-                if user:
-                    embed = discord.Embed(
-                        title="📅 打ち合わせの打診",
-                        description=f"**{interaction.user.display_name}** さんから提案があります。",
-                        color=config.COLOR_PRIMARY,
-                    )
-                    embed.add_field(name="📆 日時", value=dt, inline=True)
-                    embed.add_field(name="📝 内容", value=subject, inline=True)
-                    embed.set_thumbnail(url=interaction.user.display_avatar.url)
-                    embed.set_footer(text="しんちょくん 🤖 | 日程調整")
+            if user := await self.bot.fetch_user(uid):
+                embed = discord.Embed(
+                    title="📅 打ち合わせの打診",
+                    description=f"**{interaction.user.display_name}** さんから提案があります。",
+                    color=config.COLOR_PRIMARY,
+                )
+                embed.add_field(name="📆 日時", value=dt, inline=True)
+                embed.add_field(name="📝 内容", value=subject, inline=True)
+                embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                embed.set_footer(text="しんちょくん 🤖 | 日程調整")
 
-                    from cogs.meeting import MeetingResponseView
-                    view = MeetingResponseView(self.bot, meeting_id, interaction.user.id)
-                    async with dm_limiter:
-                        await user.send(embed=embed, view=view)
+                from cogs.meeting import MeetingResponseView
+                view = MeetingResponseView(self.bot, meeting_id, interaction.user.id)
+                success = await send_dm_safely(user, embed=embed, view=view)
+                if success:
                     sent += 1
-            except Exception as e:
-                logger.error(f"❌ ミーティングDM送信エラー ({uid}): {e}")
 
         await interaction.followup.send(f"✅ {sent}人にミーティング打診を送信しました！\n📆 {dt} | 📝 {subject}", ephemeral=True)
 
@@ -261,33 +259,28 @@ class PeerBonusModal(discord.ui.Modal, title="🎁 ピアボーナス"):
         await exp_manager.grant_exp(self.target_id, config.EXP_REWARDS["peer_bonus_receive"], "ピアボーナス受信", guild=guild)
 
         # 相手にDM
-        try:
-            target_user = await self.bot.fetch_user(self.target_id)
-            if target_user:
-                bonus_msg = "感謝のメッセージが届きました 💌"
-                if self.bot.sheets:
-                    custom = self.bot.sheets.get_message(self.target_id, "peer_bonus")
-                    if custom:
-                        bonus_msg = custom
+        if target_user := await self.bot.fetch_user(self.target_id):
+            bonus_msg = "感謝のメッセージが届きました 💌"
+            if self.bot.sheets:
+                custom = self.bot.sheets.get_message(self.target_id, "peer_bonus")
+                if custom:
+                    bonus_msg = custom
 
-                nickname = ""
-                if self.bot.sheets:
-                    nickname = self.bot.sheets.get_member_nickname(sender.id)
-                sender_name = nickname or sender.display_name
+            nickname = ""
+            if self.bot.sheets:
+                nickname = self.bot.sheets.get_member_nickname(sender.id)
+            sender_name = nickname or sender.display_name
 
-                embed = discord.Embed(
-                    title=f"🎁 {bonus_msg}",
-                    description=f"**{sender_name}** さんからの感謝です。",
-                    color=config.COLOR_PEER,
-                )
-                embed.add_field(name="💬 メッセージ", value=msg_text, inline=False)
-                embed.add_field(name="⭐ ボーナス", value=f"+{config.EXP_REWARDS['peer_bonus_receive']} EXP", inline=True)
-                embed.set_thumbnail(url=sender.display_avatar.url)
-                embed.set_footer(text="しんちょくん 🤖 | ピアボーナス")
-                async with dm_limiter:
-                    await target_user.send(embed=embed)
-        except Exception as e:
-            logger.error(f"❌ ピアボーナスDM送信エラー: {e}")
+            embed = discord.Embed(
+                title=f"🎁 {bonus_msg}",
+                description=f"**{sender_name}** さんからの感謝です。",
+                color=config.COLOR_PEER,
+            )
+            embed.add_field(name="💬 メッセージ", value=msg_text, inline=False)
+            embed.add_field(name="⭐ ボーナス", value=f"+{config.EXP_REWARDS['peer_bonus_receive']} EXP", inline=True)
+            embed.set_thumbnail(url=sender.display_avatar.url)
+            embed.set_footer(text="しんちょくん 🤖 | ピアボーナス")
+            await send_dm_safely(target_user, embed=embed)
 
         remaining = config.PEER_BONUS_DAILY_LIMIT - today_count - 1
         await interaction.followup.send(
@@ -363,26 +356,21 @@ class TaskRequestModal(discord.ui.Modal, title="📝 タスク追加申請"):
 
         leader_info = self.bot.sheets.get_leader() if self.bot.sheets else None
         leader_id = leader_info["discord_id"] if leader_info else config.LEADER_ID
-        try:
-            leader = await self.bot.fetch_user(leader_id)
-            if leader:
-                embed = discord.Embed(
-                    title="📝 タスク追加申請",
-                    description=f"**{interaction.user.display_name}** さんからタスク申請があります。",
-                    color=config.COLOR_PRIMARY,
-                )
-                embed.add_field(name="📋 タスク名", value=title, inline=False)
-                if detail:
-                    embed.add_field(name="📝 詳細", value=detail, inline=False)
-                embed.add_field(name="⭐ 希望EXP", value=f"{exp} EXP", inline=True)
-                embed.add_field(name="📅 対象週", value=self.week_start, inline=True)
-                embed.set_thumbnail(url=interaction.user.display_avatar.url)
-                embed.set_footer(text=f"しんちょくん 🤖 | 申請ID: {req_id}")
-                view = TaskApprovalView(self.bot, req_id)
-                async with dm_limiter:
-                    await leader.send(embed=embed, view=view)
-        except Exception as e:
-            logger.error(f"❌ タスク申請通知エラー: {e}")
+        if leader := await self.bot.fetch_user(leader_id):
+            embed = discord.Embed(
+                title="📝 タスク追加申請",
+                description=f"**{interaction.user.display_name}** さんからタスク申請があります。",
+                color=config.COLOR_PRIMARY,
+            )
+            embed.add_field(name="📋 タスク名", value=title, inline=False)
+            if detail:
+                embed.add_field(name="📝 詳細", value=detail, inline=False)
+            embed.add_field(name="⭐ 希望EXP", value=f"{exp} EXP", inline=True)
+            embed.add_field(name="📅 対象週", value=self.week_start, inline=True)
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            embed.set_footer(text=f"しんちょくん 🤖 | 申請ID: {req_id}")
+            view = TaskApprovalView(self.bot, req_id)
+            await send_dm_safely(leader, embed=embed, view=view)
 
         await interaction.followup.send(
             f"✅ タスク申請を送信しました！\n📋 {title} | ⭐ {exp} EXP | 📅 {self.week_start}",
@@ -420,17 +408,12 @@ class TaskApprovalView(discord.ui.View):
             except Exception as e:
                 logger.error(f"❌ Sheetsタスク追記エラー: {e}")
 
-        try:
-            user = await self.bot.fetch_user(req["discord_id"])
-            if user:
-                embed = discord.Embed(title="✅ タスク申請が承認されました！", color=config.COLOR_SUCCESS)
-                embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
-                embed.add_field(name="⭐ EXP", value=f"{req['requested_exp']} EXP", inline=True)
-                embed.set_footer(text="しんちょくん 🤖")
-                async with dm_limiter:
-                    await user.send(embed=embed)
-        except Exception as e:
-            logger.error(f"❌ 承認通知エラー: {e}")
+        if user := await self.bot.fetch_user(req["discord_id"]):
+            embed = discord.Embed(title="✅ タスク申請が承認されました！", color=config.COLOR_SUCCESS)
+            embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
+            embed.add_field(name="⭐ EXP", value=f"{req['requested_exp']} EXP", inline=True)
+            embed.set_footer(text="しんちょくん 🤖")
+            await send_dm_safely(user, embed=embed)
 
         await self._disable_buttons(interaction)
         await interaction.followup.send("✅ 承認しました！ Sheetsに追記済みです。", ephemeral=True)
@@ -477,18 +460,13 @@ class TaskAdoptModal(discord.ui.Modal, title="📝 採用（変更あり）"):
             except Exception as e:
                 logger.error(f"❌ Sheetsタスク追記エラー: {e}")
 
-        try:
-            user = await self.bot.fetch_user(req["discord_id"])
-            if user:
-                embed = discord.Embed(title="📝 タスク申請が採用されました！", color=config.COLOR_PRIMARY)
-                embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
-                embed.add_field(name="💬 リーダーより", value=comment, inline=False)
-                embed.add_field(name="⭐ EXP", value=f"{req['requested_exp']} EXP", inline=True)
-                embed.set_footer(text="しんちょくん 🤖 | 内容に変更がある場合があります")
-                async with dm_limiter:
-                    await user.send(embed=embed)
-        except Exception as e:
-            logger.error(f"❌ 採用通知エラー: {e}")
+        if user := await self.bot.fetch_user(req["discord_id"]):
+            embed = discord.Embed(title="📝 タスク申請が採用されました！", color=config.COLOR_PRIMARY)
+            embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
+            embed.add_field(name="💬 リーダーより", value=comment, inline=False)
+            embed.add_field(name="⭐ EXP", value=f"{req['requested_exp']} EXP", inline=True)
+            embed.set_footer(text="しんちょくん 🤖 | 内容に変更がある場合があります")
+            await send_dm_safely(user, embed=embed)
 
         await interaction.followup.send("📝 採用しました！ Sheetsに追記済みです。", ephemeral=True)
 
@@ -515,17 +493,12 @@ class TaskReviewModal(discord.ui.Modal, title="🤔 検討中"):
         comment = self.comment_input.value.strip()
         await self.bot.db.update_task_request(self.request_id, "reviewing", interaction.user.id, comment)
 
-        try:
-            user = await self.bot.fetch_user(req["discord_id"])
-            if user:
-                embed = discord.Embed(title="🤔 タスク申請を検討中です", color=config.COLOR_WARNING)
-                embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
-                embed.add_field(name="💬 リーダーより", value=comment, inline=False)
-                embed.set_footer(text="しんちょくん 🤖 | 後日改めて連絡があります")
-                async with dm_limiter:
-                    await user.send(embed=embed)
-        except Exception as e:
-            logger.error(f"❌ 検討通知エラー: {e}")
+        if user := await self.bot.fetch_user(req["discord_id"]):
+            embed = discord.Embed(title="🤔 タスク申請を検討中です", color=config.COLOR_WARNING)
+            embed.add_field(name="📋 タスク名", value=req["quest_title"], inline=False)
+            embed.add_field(name="💬 リーダーより", value=comment, inline=False)
+            embed.set_footer(text="しんちょくん 🤖 | 後日改めて連絡があります")
+            await send_dm_safely(user, embed=embed)
 
         await interaction.followup.send("🤔 検討中にしました。申請者に通知済みです。", ephemeral=True)
 
@@ -609,15 +582,14 @@ class ResendQuestView(discord.ui.View):
             from cogs.quest import QuestView
             view = QuestView(self.bot)
             
-            await interaction.user.send(embed=embed, view=view)
-            await interaction.followup.send("✅ DMに未完クエストを再通知しました！", ephemeral=True)
-            
-            button.disabled = True
-            button.label = "📩 再通知済み"
-            await interaction.edit_original_response(view=self)
-            
-        except discord.Forbidden:
-            await interaction.followup.send("⚠️ DMを送信できませんでした。サーバーのプライバシー設定を確認してください。", ephemeral=True)
+            success = await send_dm_safely(interaction.user, embed=embed, view=view)
+            if success:
+                await interaction.followup.send("✅ DMに未完クエストを再通知しました！", ephemeral=True)
+                button.disabled = True
+                button.label = "📩 再通知済み"
+                await interaction.edit_original_response(view=self)
+            else:
+                await interaction.followup.send("⚠️ DMを送信できませんでした。サーバーのプライバシー設定を確認してください。", ephemeral=True)
         except Exception as e:
             logger.error(f"❌ 再送信エラー: {e}")
             await interaction.followup.send(f"❌ 送信に失敗しました: {e}", ephemeral=True)

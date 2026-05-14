@@ -7,6 +7,17 @@ cogs/scheduler.py — 日程調整「調整さん」方式（v2.2 新規）
 3. 48時間 or 全員回答で自動集計
 4. リーダーDMに集計結果 + 確定ボタン
 5. 確定 → Discordサーバーイベント自動作成 + 全員にDM通知
+
+【このファイルで学べること】
+- discord.ui.Select を用いた複数選択のUI作成（min_values, max_values）
+- discord.Guild.create_scheduled_event によるサーバーイベント作成
+- utils.messaging.send_dm_safely を用いた一括DM送信のエラーハンドリング
+
+【実務的な設計意図（イベント駆動とスケジュール実行）】
+日程調整の集計は「全員が回答した瞬間（イベント駆動）」と「期限が切れた時（スケジュール実行）」
+の2つのトリガーで動作します。定期実行（bot.pyのAPScheduler経由）と
+ユーザー操作の両方から同じ `_tally_and_notify` ロジックを呼ぶことで、
+漏れなく集計を行いつつ、迅速な結果反映を実現しています。
 """
 
 import json
@@ -18,6 +29,7 @@ from discord.ext import commands
 
 import config
 from rate_limiter import dm_limiter
+from utils.messaging import send_dm_safely
 
 logger = logging.getLogger(__name__)
 JST = timezone(timedelta(hours=9))
@@ -64,42 +76,7 @@ class ScheduleCreateModal(discord.ui.Modal, title="📊 日程調整を作成"):
             expires_at=expires_at,
         )
 
-        # 全メンバーにDM送信
-        member_ids = config.get_active_member_ids()
-        sent = 0
-        for uid in member_ids:
-            if uid == interaction.user.id:
-                continue
-            try:
-                user = await self.bot.fetch_user(uid)
-                if user:
-                    embed = discord.Embed(
-                        title="📊 日程調整のお知らせ",
-                        description=(
-                            f"**{interaction.user.display_name}** さんが日程調整を作成しました。\n"
-                            f"出席可能な日時をすべて選択してください。"
-                        ),
-                        color=config.COLOR_PRIMARY,
-                    )
-                    embed.add_field(name="📝 議題", value=subject, inline=False)
-                    embed.add_field(
-                        name="📅 候補日時",
-                        value="\n".join(f"• {c}" for c in candidates),
-                        inline=False,
-                    )
-                    embed.add_field(
-                        name="⏰ 回答期限",
-                        value=f"{POLL_EXPIRE_HOURS}時間以内",
-                        inline=True,
-                    )
-                    embed.set_footer(text=f"しんちょくん 🤖 | 投票ID: {poll_id}")
-
-                    view = ScheduleVoteView(self.bot, poll_id, candidates)
-                    async with dm_limiter:
-                        await user.send(embed=embed, view=view)
-                    sent += 1
-            except Exception as e:
-                logger.error(f"❌ 日程調整DM送信エラー ({uid}): {e}")
+        sent = await self._broadcast_poll(interaction, poll_id, subject, candidates)
 
         await interaction.followup.send(
             f"✅ 日程調整を作成しました！ **{sent}人** にDMを送信しました。\n"
@@ -108,6 +85,41 @@ class ScheduleCreateModal(discord.ui.Modal, title="📊 日程調整を作成"):
             ephemeral=True,
         )
         logger.info(f"📊 日程調整作成: poll_id={poll_id}, {sent}人に送信")
+
+    async def _broadcast_poll(self, interaction: discord.Interaction, poll_id: int, subject: str, candidates: list[str]) -> int:
+        """全メンバーに投票DMを一括送信する（関数分割）"""
+        member_ids = config.get_active_member_ids()
+        sent = 0
+        for uid in member_ids:
+            if uid == interaction.user.id:
+                continue
+            if user := await self.bot.fetch_user(uid):
+                embed = discord.Embed(
+                    title="📊 日程調整のお知らせ",
+                    description=(
+                        f"**{interaction.user.display_name}** さんが日程調整を作成しました。\n"
+                        f"出席可能な日時をすべて選択してください。"
+                    ),
+                    color=config.COLOR_PRIMARY,
+                )
+                embed.add_field(name="📝 議題", value=subject, inline=False)
+                embed.add_field(
+                    name="📅 候補日時",
+                    value="\n".join(f"• {c}" for c in candidates),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="⏰ 回答期限",
+                    value=f"{POLL_EXPIRE_HOURS}時間以内",
+                    inline=True,
+                )
+                embed.set_footer(text=f"しんちょくん 🤖 | 投票ID: {poll_id}")
+
+                view = ScheduleVoteView(self.bot, poll_id, candidates)
+                success = await send_dm_safely(user, embed=embed, view=view)
+                if success:
+                    sent += 1
+        return sent
 
 
 # ============================================
@@ -225,22 +237,17 @@ class ScheduleConfirmView(discord.ui.View):
         # 全メンバーに確定通知
         member_ids = config.get_active_member_ids()
         for uid in member_ids:
-            try:
-                user = await self.bot.fetch_user(uid)
-                if user:
-                    embed = discord.Embed(
-                        title="📅 日程が確定しました！",
-                        description=f"**{poll['subject']}**",
-                        color=config.COLOR_SUCCESS,
-                    )
-                    embed.add_field(name="📆 確定日時", value=slot, inline=False)
-                    if event_id:
-                        embed.add_field(name="🔔 サーバーイベント", value="自動作成済み", inline=True)
-                    embed.set_footer(text="しんちょくん 🤖 | 日程確定")
-                    async with dm_limiter:
-                        await user.send(embed=embed)
-            except Exception as e:
-                logger.error(f"❌ 確定通知エラー ({uid}): {e}")
+            if user := await self.bot.fetch_user(uid):
+                embed = discord.Embed(
+                    title="📅 日程が確定しました！",
+                    description=f"**{poll['subject']}**",
+                    color=config.COLOR_SUCCESS,
+                )
+                embed.add_field(name="📆 確定日時", value=slot, inline=False)
+                if event_id:
+                    embed.add_field(name="🔔 サーバーイベント", value="自動作成済み", inline=True)
+                embed.set_footer(text="しんちょくん 🤖 | 日程確定")
+                await send_dm_safely(user, embed=embed)
 
         event_msg = "\n🔔 サーバーイベントを作成しました！" if event_id else ""
         await interaction.followup.send(
@@ -275,34 +282,29 @@ async def _tally_and_notify(bot: commands.Bot, poll_id: int):
     ranked_with_total = [(slot, count, total) for slot, count in ranked]
 
     # 作成者にDMで結果を送信
-    try:
-        creator = await bot.fetch_user(poll["created_by"])
-        if creator:
-            embed = discord.Embed(
-                title="📊 日程調整の集計結果",
-                description=f"**{poll['subject']}**\n回答者: {total}人",
-                color=config.COLOR_PRIMARY,
-            )
-            result_lines = []
-            for slot, count, t in ranked_with_total:
-                bar = "█" * count + "░" * (t - count)
-                star = " ⭐" if count == ranked_with_total[0][1] and count > 0 else ""
-                result_lines.append(f"**{slot}** [{bar}] {count}/{t}{star}")
-            embed.add_field(
-                name="📅 結果", value="\n".join(result_lines) or "回答なし", inline=False,
-            )
-            embed.add_field(
-                name="💡 操作", value="下のボタンで日時を確定してください。", inline=False,
-            )
-            embed.set_footer(text=f"しんちょくん 🤖 | 投票ID: {poll_id}")
+    if creator := await bot.fetch_user(poll["created_by"]):
+        embed = discord.Embed(
+            title="📊 日程調整の集計結果",
+            description=f"**{poll['subject']}**\n回答者: {total}人",
+            color=config.COLOR_PRIMARY,
+        )
+        result_lines = []
+        for slot, count, t in ranked_with_total:
+            bar = "█" * count + "░" * (t - count)
+            star = " ⭐" if count == ranked_with_total[0][1] and count > 0 else ""
+            result_lines.append(f"**{slot}** [{bar}] {count}/{t}{star}")
+        embed.add_field(
+            name="📅 結果", value="\n".join(result_lines) or "回答なし", inline=False,
+        )
+        embed.add_field(
+            name="💡 操作", value="下のボタンで日時を確定してください。", inline=False,
+        )
+        embed.set_footer(text=f"しんちょくん 🤖 | 投票ID: {poll_id}")
 
-            view = ScheduleConfirmView(bot, poll_id, ranked_with_total)
-            async with dm_limiter:
-                await creator.send(embed=embed, view=view)
+        view = ScheduleConfirmView(bot, poll_id, ranked_with_total)
+        await send_dm_safely(creator, embed=embed, view=view)
 
-            logger.info(f"📊 集計完了: poll_id={poll_id}")
-    except Exception as e:
-        logger.error(f"❌ 集計結果通知エラー: {e}")
+        logger.info(f"📊 集計完了: poll_id={poll_id}")
 
 
 # ============================================
