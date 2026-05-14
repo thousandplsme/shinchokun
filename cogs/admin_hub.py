@@ -219,8 +219,8 @@ class SendQuestSelectView(discord.ui.View):
         self.add_item(self.user_select)
 
     async def user_callback(self, interaction: discord.Interaction):
-        target_id = int(self.user_select.values[0])
-        target = self.bot.get_user(target_id) or await self.bot.fetch_user(target_id)
+        target = self.user_select.values[0]
+        target_id = target.id
         
         await interaction.response.defer(ephemeral=True)
         quest_cog = self.bot.get_cog("QuestCog")
@@ -259,8 +259,9 @@ class SendQuestSelectView(discord.ui.View):
             
             await target.send(embed=embed, view=view)
             
-            for q in user_quests:
-                await sheets.update_quest_sent_status(week_start, target_id, q["quest_title"], True)
+            # 送信成功したクエストの sent フラグを TRUE に一括更新
+            titles = [q["quest_title"] for q in user_quests]
+            await sheets.update_quest_sent_status_bulk(week_start, target_id, titles, True)
                 
             await interaction.followup.send(f"✅ {target.display_name} さんに {len(user_quests)}件 のクエストを追加配信しました！", ephemeral=True)
             logger.info(f"📩 追加クエスト配信: {target.name} ({len(user_quests)}件)")
@@ -286,6 +287,19 @@ class AdminHubView(discord.ui.View):
             await interaction.response.send_message("⚠️ この操作は管理者専用です。", ephemeral=True)
             return False
         return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.error(f"❌ AdminHubView Error: {error}", exc_info=True)
+        if self.bot:
+            await self.bot.notify_leader_error("AdminHubView 操作", error)
+        
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ 予期せぬエラーが発生しました。リーダーに通知されました。", ephemeral=True)
+            else:
+                await interaction.followup.send("❌ 予期せぬエラーが発生しました。リーダーに通知されました。", ephemeral=True)
+        except Exception:
+            pass
 
     @discord.ui.button(label="🏅 隠し称号の付与", style=discord.ButtonStyle.success, custom_id="admin_hub_title", row=0)
     async def hidden_title_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -324,17 +338,21 @@ class AdminHubView(discord.ui.View):
     @discord.ui.button(label="🔄 データ同期", style=discord.ButtonStyle.danger, custom_id="admin_hub_sync", row=1)
     async def sync_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self._check_admin(interaction): return
-        commands_cog = self.bot.get_cog("CommandsCog")
-        if commands_cog:
-            await interaction.response.send_message("⏳ データ同期（EXP・ロール）を実行中...", ephemeral=True)
-            # sync_exp の呼び出し（Interactionを直接渡すと重複応答エラーになるため、内部で処理を分けるかラップするべきですが、簡単のため直接コールバック呼び出し）
-            # sync_exp / sync_roles は内部で followup/response.send を呼ぶため、一括ボタンにする場合は注意が必要。
-            # ここでは別々に選べる View を返す方が安全です。
-            
-            view = AdminSyncSelectView(self.bot)
-            await interaction.edit_original_response(content="🔄 同期する項目を選択してください", view=view)
-        else:
-            await interaction.response.send_message("⚠️ CommandsCogが読み込まれていません。", ephemeral=True)
+        await interaction.response.send_message("⏳ 同期・リセットする項目を選択してください", ephemeral=True)
+        view = AdminSyncSelectView(self.bot)
+        await interaction.edit_original_response(view=view)
+
+    @discord.ui.button(label="🧹 配信状況リセット", style=discord.ButtonStyle.secondary, custom_id="admin_hub_reset_sent", row=1)
+    async def reset_sent_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_admin(interaction): return
+        view = ResetSentUserSelectView(self.bot)
+        await interaction.response.send_message("🧹 **配信状況のリセット**\nリセットしたいメンバーを選択してください。", view=view, ephemeral=True)
+
+    @discord.ui.button(label="✏️ ステータス手動修正", style=discord.ButtonStyle.secondary, custom_id="admin_hub_fix_status", row=1)
+    async def fix_status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_admin(interaction): return
+        view = FixStatusUserSelectView(self.bot)
+        await interaction.response.send_message("✏️ **ステータスの手動修正**\n修正したいメンバーを選択してください。", view=view, ephemeral=True)
 
 
 class AdminSyncSelectView(discord.ui.View):
@@ -345,11 +363,16 @@ class AdminSyncSelectView(discord.ui.View):
     @discord.ui.button(label="EXP同期", style=discord.ButtonStyle.primary)
     async def sync_exp_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
         try:
-            logs = await self.bot.db.get_all_exp_logs()
+            logs = await sheets.get_all_exp_logs()
         except Exception as e:
-            logger.error(f"❌ EXPログ取得エラー: {e}")
-            await interaction.followup.send("⚠️ ログの取得に失敗しました。", ephemeral=True)
+            logger.error(f"❌ EXPログ(Sheets)取得エラー: {e}")
+            await interaction.followup.send("⚠️ スプレッドシートからのログ取得に失敗しました。", ephemeral=True)
             return
 
         if not logs:
@@ -414,14 +437,91 @@ class AdminSyncSelectView(discord.ui.View):
             results.append(f"**{name}**: {old_exp} → {new_exp} ({diff_str})")
 
         embed = discord.Embed(
-            title="🔄 EXP同期完了",
-            description=f"EXPログ {len(logs)} 件から {len(totals)} 人分を同期しました。",
+            title="🔄 EXP同期(Sheets基準)完了",
+            description=f"スプレッドシートのログ {len(logs)} 件に基づき同期しました。",
             color=config.COLOR_SUCCESS,
         )
         embed.add_field(name="📊 同期結果", value="\n".join(results) or "なし", inline=False)
         embed.set_footer(text="しんちょくん 🤖 | EXP同期")
         await interaction.followup.send(embed=embed, ephemeral=True)
-        logger.info(f"🔄 EXP同期完了: {len(totals)}人")
+        logger.info(f"🔄 EXP同期(Sheets)完了: {len(totals)}人")
+
+    @discord.ui.button(label="クエスト同期", style=discord.ButtonStyle.primary)
+    async def sync_quests_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
+        try:
+            week_start = sheets.get_current_week_start()
+            all_quests = await sheets.get_weekly_quests(week_start)
+            
+            success_count = 0
+            for q in all_quests:
+                if q.get("status") == "完了":
+                    # DBに記録（既にある場合は無視される）
+                    res = await self.bot.db.record_quest_completion(
+                        discord_id=q["discord_id"],
+                        week_start=q["week_start"],
+                        quest_title=q["quest_title"],
+                        exp_earned=q.get("exp_reward", 0)
+                    )
+                    if res: success_count += 1
+            
+            embed = discord.Embed(
+                title="🔄 クエスト状況同期完了",
+                description=f"スプレッドシートの「完了」ステータスをDBに反映しました。\n新規同期: **{success_count}** 件",
+                color=config.COLOR_SUCCESS,
+            )
+            embed.set_footer(text="しんちょくん 🤖 | クエスト同期")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"🔄 クエスト状況同期(Sheets->DB): {success_count}件反映")
+            
+        except Exception as e:
+            logger.error(f"❌ クエスト同期エラー: {e}")
+            await interaction.followup.send(f"⚠️ 同期に失敗しました: {e}", ephemeral=True)
+
+    @discord.ui.button(label="EXPバックアップ", style=discord.ButtonStyle.secondary)
+    async def backup_exp_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """DBのEXPログをスプレッドシートに書き出す（DB -> Sheets）"""
+        await interaction.response.defer(ephemeral=True)
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
+        try:
+            db_logs = await self.bot.db.get_all_exp_logs()
+            sheet_logs = await sheets.get_all_exp_logs()
+            
+            # 既にシートにあるログをセット化して重複チェック（簡易版）
+            existing_keys = set()
+            for sl in sheet_logs:
+                # 秒以下の精度やフォーマットの違いを考慮しつつキーを作成
+                key = f"{sl['discord_id']}_{sl['amount']}_{sl['reason']}"
+                existing_keys.add(key)
+            
+            new_count = 0
+            for dl in db_logs:
+                key = f"{dl['discord_id']}_{dl['amount']}_{dl['reason']}"
+                if key not in existing_keys:
+                    await sheets.append_exp_log(dl["discord_id"], dl["amount"], dl["reason"])
+                    new_count += 1
+            
+            embed = discord.Embed(
+                title="💾 EXPバックアップ完了",
+                description=f"DBにのみ存在するEXPログをスプレッドシートに書き出しました。\n新規追加: **{new_count}** 件",
+                color=config.COLOR_SUCCESS,
+            )
+            embed.set_footer(text="しんちょくん 🤖 | EXPバックアップ")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"💾 EXPバックアップ(DB->Sheets): {new_count}件追加")
+            
+        except Exception as e:
+            logger.error(f"❌ EXPバックアップエラー: {e}")
+            await interaction.followup.send(f"⚠️ バックアップに失敗しました: {e}", ephemeral=True)
 
     @discord.ui.button(label="ロール同期", style=discord.ButtonStyle.primary)
     async def sync_roles_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -432,72 +532,219 @@ class AdminSyncSelectView(discord.ui.View):
             await interaction.followup.send("⚠️ サーバー内で実行してください。", ephemeral=True)
             return
 
-        exp_manager = ExpManager(self.bot.db, getattr(self.bot, "sheets", None))
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
+        # 1. スプレッドシートから最新の累計EXPを算出
+        try:
+            logs = await sheets.get_all_exp_logs()
+            totals = {}
+            for log in logs:
+                uid = log["discord_id"]
+                totals[uid] = totals.get(uid, 0) + log["amount"]
+        except Exception as e:
+            logger.error(f"❌ ロール同期中のEXP取得失敗: {e}")
+            await interaction.followup.send(f"⚠️ データ取得に失敗しました: {e}", ephemeral=True)
+            return
+
+        exp_manager = ExpManager(self.bot.db, sheets)
         member_ids = config.get_active_member_ids()
         success = 0
         errors = []
 
         for uid in member_ids:
             try:
+                # 最新EXPからレベルと称号を確定
+                new_exp = totals.get(uid, 0)
+                new_level = TitleSystem.calculate_level(new_exp)
+                
+                # DBプロフィールを最新化（または作成）
                 profile = await exp_manager.ensure_profile(uid, guild=guild)
-                level = profile["level"]
-
                 job_type = profile.get("job_type", "")
-                if not job_type and getattr(self.bot, "sheets", None):
-                    member_info = self.bot.sheets.get_member(uid)
+                if not job_type:
+                    member_info = sheets.get_member(uid)
                     if member_info:
                         job_type = member_info.get("job_type", "")
-                job_name = self.bot.sheets.get_job_name(job_type) if getattr(self.bot, "sheets", None) else job_type
-                title = TitleSystem.get_title(level, job_name)
+                
+                job_name = sheets.get_job_name(job_type) or job_type
+                title = TitleSystem.get_title(new_level, job_name)
 
-                if title != profile["current_title"]:
-                    logger.info(f"🔧 称号修復: ID={uid}, '{profile['current_title']}' → '{title}'")
-                    await self.bot.db.upsert_user_profile(
-                        discord_id=uid, total_exp=profile["total_exp"], level=level,
-                        job_type=job_type, current_title=title,
-                        consecutive_weeks=profile.get("consecutive_weeks", 0),
-                    )
+                # DB更新
+                await self.bot.db.upsert_user_profile(
+                    discord_id=uid, total_exp=new_exp, level=new_level,
+                    job_type=job_type, current_title=title,
+                    consecutive_weeks=profile.get("consecutive_weeks", 0),
+                )
 
-                if not title or not title.strip():
-                    continue
-
-                role = discord.utils.get(guild.roles, name=title)
-                if role is None:
-                    rank = TitleSystem.get_title_rank(level)
-                    color = discord.Color(config.ROLE_COLORS.get(rank, 0x95A5A6))
-                    role = await guild.create_role(
-                        name=title, color=color,
-                        reason="しんちょくん: 称号ロール一括作成",
-                    )
-                    logger.info(f"✨ ロール作成: {title}")
-
-                member = guild.get_member(uid)
-                if member is None:
-                    member = await guild.fetch_member(uid)
-                if role not in member.roles:
-                    await member.add_roles(role, reason="称号ロール一括同期")
+                # ロール付与
+                if title:
+                    role = discord.utils.get(guild.roles, name=title)
+                    if role is None:
+                        rank = TitleSystem.get_title_rank(new_level)
+                        color = discord.Color(config.ROLE_COLORS.get(rank, 0x95A5A6))
+                        role = await guild.create_role(name=title, color=color, reason="称号ロール一括作成")
+                    
+                    member = guild.get_member(uid) or await guild.fetch_member(uid)
+                    if role not in member.roles:
+                        await member.add_roles(role, reason="称号ロール同期(Sheets基準)")
 
                 success += 1
-                user = self.bot.get_user(uid)
-                logger.info(f"🏅 ロール同期: {user.display_name if user else uid} → {title}")
+                logger.info(f"🏅 ロール同期(Sheets基準): {uid} → {title} (EXP:{new_exp})")
 
-            except discord.NotFound:
-                errors.append(f"ID:{uid} — メンバーが見つかりません")
-            except discord.Forbidden:
-                errors.append(f"ID:{uid} — 権限不足")
             except Exception as e:
                 errors.append(f"ID:{uid} — {e}")
 
         embed = discord.Embed(
             title="🏅 ロール同期完了",
-            description=f"**{success}/{len(member_ids)}** 人にロールを付与しました。",
+            description=f"スプレッドシートのEXPに基づき、**{success}/{len(member_ids)}** 人のロールを同期しました。",
             color=config.COLOR_SUCCESS if not errors else config.COLOR_WARNING,
         )
         if errors:
             embed.add_field(name="⚠️ エラー", value="\n".join(errors[:5]), inline=False)
         embed.set_footer(text="しんちょくん 🤖 | ロール同期")
         await interaction.followup.send(embed=embed, ephemeral=True)
-        logger.info(f"🏅 ロール同期完了: {success}/{len(member_ids)}人")
+
+
+# ============================================
+# クエスト配信状況リセット UI
+# ============================================
+
+class ResetSentUserSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.user_select = discord.ui.UserSelect(placeholder="リセットするメンバーを選択...")
+        self.user_select.callback = self.user_callback
+        self.add_item(self.user_select)
+
+    async def user_callback(self, interaction: discord.Interaction):
+        target_id = self.user_select.values[0].id
+        await interaction.response.defer(ephemeral=True)
+        
+        sheets = self.bot.sheets
+        if not sheets: return
+        
+        week_start = sheets.get_current_week_start()
+        quests = await sheets.get_weekly_quests(week_start)
+        user_quests = [q for q in quests if q["discord_id"] == target_id and q.get("sent", False)]
+        
+        if not user_quests:
+            await interaction.followup.send("✅ 送信済みのクエストはありません。", ephemeral=True)
+            return
+
+        view = ResetSentQuestSelectView(self.bot, target_id, user_quests, week_start)
+        await interaction.followup.send(f"🧹 リセットするクエストを選択してください（{len(user_quests)}件）", view=view, ephemeral=True)
+
+class ResetSentQuestSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, target_id: int, quests: list[dict], week_start: str):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.target_id = target_id
+        self.week_start = week_start
+        
+        options = [
+            discord.SelectOption(label=q["quest_title"][:100], value=q["quest_title"])
+            for q in quests
+        ]
+        self.select = discord.ui.Select(placeholder="クエストを選択...", options=options, min_values=1, max_values=len(options))
+        self.select.callback = self.select_callback
+        self.add_item(self.select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        titles = self.select.values
+        
+        try:
+            await self.bot.sheets.update_quest_sent_status_bulk(self.week_start, self.target_id, titles, False)
+            await interaction.followup.send(f"✅ {len(titles)}件 のクエスト配信状況をリセットしました（再配信可能になりました）。", ephemeral=True)
+        except Exception as e:
+            logger.error(f"❌ 配信状況リセットエラー: {e}")
+            await interaction.followup.send(f"❌ リセットに失敗しました:\n```{e}```", ephemeral=True)
+
+
+class FixStatusUserSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.user_select = discord.ui.UserSelect(placeholder="修正するメンバーを選択...")
+        self.user_select.callback = self.user_callback
+        self.add_item(self.user_select)
+
+    async def user_callback(self, interaction: discord.Interaction):
+        target_id = self.user_select.values[0].id
+        await interaction.response.defer(ephemeral=True)
+        
+        sheets = self.bot.sheets
+        if not sheets: return
+        
+        week_start = sheets.get_current_week_start()
+        quests = await sheets.get_weekly_quests(week_start)
+        user_quests = [q for q in quests if q["discord_id"] == target_id]
+        
+        if not user_quests:
+            await interaction.followup.send("✅ 該当するクエストはありません。", ephemeral=True)
+            return
+
+        view = FixStatusQuestSelectView(self.bot, target_id, user_quests, week_start)
+        await interaction.followup.send(f"✏️ 修正するクエストを選択してください（{len(user_quests)}件）", view=view, ephemeral=True)
+
+class FixStatusQuestSelectView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, target_id: int, quests: list[dict], week_start: str):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.target_id = target_id
+        self.week_start = week_start
+        
+        options = [
+            discord.SelectOption(label=f"{q['quest_title'][:50]} ({q['status']})", value=q["quest_title"])
+            for q in quests
+        ]
+        self.select = discord.ui.Select(placeholder="クエストを選択...", options=options)
+        self.select.callback = self.select_callback
+        self.add_item(self.select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        title = self.select.values[0]
+        view = FixStatusActionView(self.bot, self.target_id, title, self.week_start)
+        await interaction.response.send_message(f"🛠️ 『{title}』の新しいステータスを選択してください。", view=view, ephemeral=True)
+
+class FixStatusActionView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, target_id: int, title: str, week_start: str):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.target_id = target_id
+        self.title = title
+        self.week_start = week_start
+
+    @discord.ui.button(label="未着手", style=discord.ButtonStyle.secondary)
+    async def status_todo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "未着手")
+
+    @discord.ui.button(label="進行中", style=discord.ButtonStyle.primary)
+    async def status_doing(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "進行中")
+
+    @discord.ui.button(label="完了", style=discord.ButtonStyle.success)
+    async def status_done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "完了")
+
+    @discord.ui.button(label="延長", style=discord.ButtonStyle.secondary)
+    async def status_extend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "延長")
+
+    @discord.ui.button(label="辞退", style=discord.ButtonStyle.danger)
+    async def status_decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "辞退")
+
+    async def _update(self, interaction: discord.Interaction, status: str):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self.bot.sheets.update_quest_status(self.week_start, self.target_id, self.title, status)
+            await interaction.followup.send(f"✅ 『{self.title}』のステータスを **{status}** に変更しました。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 更新失敗: {e}", ephemeral=True)
 
 
 # ============================================

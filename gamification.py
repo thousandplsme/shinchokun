@@ -285,48 +285,54 @@ class ExpManager:
         """
         Discordのロール（役職）を更新する。
         
-        【ロール管理の流れ】
-        1. 旧称号のロールがあれば剥奪
-        2. 新称号のロールがなければ作成（色付き）
-        3. 新ロールをメンバーに付与
-        
-        【discord.utils.get() とは？】
-        条件に一致する最初の要素を返すユーティリティ関数。
-        ここでは「ロール名が一致するロール」を検索するために使用。
+        【実務的な設計意図（SRP: 単一責任の原則）】
+        以前はこのメソッドの中に「旧ロール剥奪」「新ロール作成」「新ロール付与」の
+        全てが含まれていました。それを3つの小さなメソッドに分割することで、
+        各メソッドが「1つのことだけを行う」ようになり、可読性と保守性が向上しています。
         """
         try:
             member = guild.get_member(discord_id)
             if member is None:
                 member = await guild.fetch_member(discord_id)
 
-            # 旧ロールを検索して剥奪
             if old_title:
-                old_role = discord.utils.get(guild.roles, name=old_title)
-                if old_role and old_role in member.roles:
-                    await member.remove_roles(old_role, reason="称号変更")
-                    logger.info(f"🔄 旧ロール剥奪: {old_title}")
+                await self._remove_old_role(guild, member, old_title)
 
-            # 新ロールを検索（なければ作成）
-            new_role = discord.utils.get(guild.roles, name=new_title)
-            if new_role is None:
-                # ロールを新規作成
-                rank = TitleSystem.get_title_rank(new_level)
-                color = discord.Color(config.ROLE_COLORS.get(rank, 0x95A5A6))
-                new_role = await guild.create_role(
-                    name=new_title,
-                    color=color,
-                    reason=f"しんちょくん: 称号ロール自動作成",
-                )
-                logger.info(f"✨ ロール作成: {new_title} (色: {color})")
-
-            # 新ロールを付与
-            await member.add_roles(new_role, reason="称号更新")
-            logger.info(f"🏅 ロール付与: {new_title} → {member.display_name}")
+            new_role = await self._get_or_create_new_role(guild, new_title, new_level)
+            await self._assign_new_role(member, new_role)
 
         except discord.Forbidden:
             logger.error(f"❌ ロール操作権限がありません。Botのロール順位を確認してください。")
         except Exception as e:
             logger.error(f"❌ ロール更新エラー: {e}")
+
+    async def _remove_old_role(self, guild: discord.Guild, member: discord.Member, old_title: str):
+        """旧称号のロールを検索して剥奪する"""
+        old_role = discord.utils.get(guild.roles, name=old_title)
+        if old_role and old_role in member.roles:
+            await member.remove_roles(old_role, reason="称号変更")
+            logger.info(f"🔄 旧ロール剥奪: {old_title}")
+
+    async def _get_or_create_new_role(self, guild: discord.Guild, new_title: str, new_level: int) -> discord.Role:
+        """新ロールを検索し、なければ作成して返す"""
+        new_role = discord.utils.get(guild.roles, name=new_title)
+        if new_role is None:
+            rank = TitleSystem.get_title_rank(new_level)
+            color = discord.Color(config.ROLE_COLORS.get(rank, 0x95A5A6))
+            new_role = await guild.create_role(
+                name=new_title,
+                color=color,
+                reason=f"しんちょくん: 称号ロール自動作成",
+            )
+            logger.info(f"✨ ロール作成: {new_title} (色: {color})")
+        return new_role
+
+    async def _assign_new_role(self, member: discord.Member, new_role: discord.Role):
+        """新ロールをメンバーに付与する"""
+        if new_role not in member.roles:
+            await member.add_roles(new_role, reason="称号更新")
+            logger.info(f"🏅 ロール付与: {new_role.name} → {member.display_name}")
+
 
     @staticmethod
     def build_levelup_message(result: dict) -> str:

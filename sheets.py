@@ -65,6 +65,13 @@ class SheetsClient:
     - メンバー情報・職種マスタは起動時にキャッシュし、API呼び出しを最小化する。
     - 全てのAPI呼び出しに @with_retry を適用し、一時的なエラーを自動リトライする。
     
+    【実務的な設計意図（キャッシュパターン）】
+    Google Sheets API には「1ユーザーあたり1分間に60リクエスト」などの
+    厳しいクオータ制限（利用枠）があります。
+    メンバーがコマンドを叩くたびにシートを読みに行くと、すぐに制限に引っかかります。
+    そのため、変動の少ないデータ（メンバー情報、職種マスタなど）は
+    起動時や特定コマンド実行時のみ取得し、メモリ上の「キャッシュ」から返す設計にしています。
+
     【asyncio.to_thread() とは？】
     同期関数（通常の def で定義された関数）を別スレッドで実行し、
     メインの非同期ループをブロックしないようにする仕組み。
@@ -264,75 +271,81 @@ class SheetsClient:
 
     @with_retry(max_retries=3, base_delay=2.0, exceptions=(gspread.exceptions.APIError,))
     async def update_quest_status(self, week_start: str, discord_id: int, quest_title: str, new_status: str):
-        """
-        クエストのステータスを更新する。
-        
-        【gspread のセル検索と更新】
-        1. findall() で week_start の列から該当行を探す
-        2. 同じ行の discord_id と quest_title が一致するか確認
-        3. 一致したら status 列を更新
-        
-        Args:
-            week_start: 週の開始日
-            discord_id: 担当メンバーID
-            quest_title: クエスト名
-            new_status: 新しいステータス（"完了" など）
-        """
-        def _update():
-            worksheet = self._spreadsheet.worksheet("週次タスク")
-            records = worksheet.get_all_records()
-            headers = worksheet.row_values(1)
-
-            # status列のインデックスを取得（1-indexed）
-            status_col = headers.index("status") + 1
-
-            for i, r in enumerate(records):
-                row_num = i + 2  # 1行目はヘッダーなので +2
-                if (
-                    str(r.get("week_start", "")) == week_start
-                    and int(r.get("discord_id", 0)) == discord_id
-                    and r.get("quest_title", "") == quest_title
-                ):
-                    worksheet.update_cell(row_num, status_col, new_status)
-                    return True
-            return False
-
-        result = await asyncio.to_thread(_update)
-        if result:
-            logger.info(f"✅ クエスト更新: {quest_title} → {new_status}")
-        else:
-            logger.warning(f"⚠️ クエストが見つかりません: {quest_title}")
-        return result
+        """クエストのステータスを更新する"""
+        return await self._update_quest_field(week_start, discord_id, quest_title, "status", new_status)
 
     @with_retry(max_retries=3, base_delay=2.0, exceptions=(gspread.exceptions.APIError,))
     async def update_quest_sent_status(self, week_start: str, discord_id: int, quest_title: str, is_sent: bool = True):
         """クエストのsent列を更新する"""
-        def _update():
-            worksheet = self._spreadsheet.worksheet("週次タスク")
-            records = worksheet.get_all_records()
-            headers = worksheet.row_values(1)
+        val = "TRUE" if is_sent else "FALSE"
+        return await self._update_quest_field(week_start, discord_id, quest_title, "sent", val)
 
-            # sent列がない場合は無視
+    def _sync_get_sheet_data(self, sheet_name: str) -> tuple[gspread.Worksheet, list[dict], list[str]]:
+        """
+        同期ヘルパー: 指定シートのワークシートオブジェクト、全レコード、ヘッダー行を取得する。
+        （to_thread 内の同期コンテキストから呼ばれることを想定）
+        """
+        worksheet = self._spreadsheet.worksheet(sheet_name)
+        records = worksheet.get_all_records()
+        headers = worksheet.row_values(1)
+        return worksheet, records, headers
+
+    @with_retry(max_retries=3, base_delay=2.0, exceptions=(gspread.exceptions.APIError,))
+    async def update_quest_sent_status_bulk(self, week_start: str, discord_id: int, quest_titles: list[str], is_sent: bool = True):
+        """複数のクエストをまとめて送信済み状態に更新する（高速化用）"""
+        def _bulk_update():
+            worksheet, records, headers = self._sync_get_sheet_data("週次タスク")
+            
             if "sent" not in headers:
                 logger.warning("⚠️ シートに 'sent' 列が存在しません")
                 return False
 
             sent_col = headers.index("sent") + 1
+            val = "TRUE" if is_sent else "FALSE"
+            
+            # 該当する行をすべて特定
+            found_count = 0
+            for i, r in enumerate(records):
+                row_num = i + 2
+                if (
+                    str(r.get("week_start", "")).strip() == week_start
+                    and int(r.get("discord_id", 0)) == discord_id
+                    and r.get("quest_title", "") in quest_titles
+                ):
+                    worksheet.update_cell(row_num, sent_col, val)
+                    found_count += 1
+            return found_count > 0
+
+        result = await asyncio.to_thread(_bulk_update)
+        if result:
+            logger.info(f"✅ クエスト一括更新({len(quest_titles)}件): {discord_id}")
+        return result
+
+    async def _update_quest_field(self, week_start: str, discord_id: int, quest_title: str, field_name: str, new_value: str):
+        """内部用：特定のクエストの特定フィールドを更新する"""
+        def _update():
+            worksheet, records, headers = self._sync_get_sheet_data("週次タスク")
+
+            if field_name not in headers:
+                logger.warning(f"⚠️ シートに '{field_name}' 列が存在しません")
+                return False
+
+            col_idx = headers.index(field_name) + 1
 
             for i, r in enumerate(records):
                 row_num = i + 2
                 if (
-                    str(r.get("week_start", "")) == week_start
+                    str(r.get("week_start", "")).strip() == week_start
                     and int(r.get("discord_id", 0)) == discord_id
                     and r.get("quest_title", "") == quest_title
                 ):
-                    worksheet.update_cell(row_num, sent_col, "TRUE" if is_sent else "FALSE")
+                    worksheet.update_cell(row_num, col_idx, new_value)
                     return True
             return False
 
         result = await asyncio.to_thread(_update)
         if result:
-            logger.info(f"✅ クエスト送信フラグ更新: {quest_title} → {is_sent}")
+            logger.info(f"✅ クエストフィールド更新: {quest_title} ({field_name}) → {new_value}")
         return result
 
     # ============================================

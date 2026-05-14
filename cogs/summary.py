@@ -100,7 +100,7 @@ class SummaryCog(commands.Cog):
             embed.add_field(name="🏆 今週のEXPランキング", value="今週のEXPデータはありません。", inline=False)
         return embed
 
-    def _build_quest_progress_embed(self, all_quests: list[dict]) -> discord.Embed:
+        def _build_quest_progress_embed(self, all_quests: list[dict]) -> discord.Embed:
         """クエスト消化率のEmbedを構築する"""
         embed = discord.Embed(title="⚔️ クエスト消化率", color=config.COLOR_QUEST)
         if all_quests:
@@ -109,8 +109,13 @@ class SummaryCog(commands.Cog):
                 uid = q["discord_id"]
                 if uid not in member_quest_map:
                     member_quest_map[uid] = {"total": 0, "completed": 0}
+                
+                st = q.get("status", "")
+                if st == "辞退":
+                    continue # 辞退は分母・分子ともに含めない
+                
                 member_quest_map[uid]["total"] += 1
-                if q.get("status", "") == "完了":
+                if st == "完了":
                     member_quest_map[uid]["completed"] += 1
 
             for uid, stats in member_quest_map.items():
@@ -121,7 +126,10 @@ class SummaryCog(commands.Cog):
                 bar = "▓" * filled + "░" * (10 - filled)
                 embed.add_field(
                     name=f"🔹 {name}",
-                    value=f"[{bar}] **{rate:.0f}%**\n達成: {stats['completed']}/{stats['total']} クエスト",
+                    value=(
+                        f"[{bar}] **{rate:.0f}%**\n"
+                        f"✅ 完了: {stats['completed']} / 全{stats['total']}件"
+                    ),
                     inline=False,
                 )
         else:

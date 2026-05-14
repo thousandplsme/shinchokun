@@ -508,6 +508,16 @@ class Database:
         )
 
 
+    async def get_all_exp_logs(self) -> list[dict]:
+        """全てのEXP獲得記録を取得する（データ同期用）"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM exp_records ORDER BY created_at ASC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
     # ============================================
     # クエスト完了記録（v2 新規）
     # ============================================
