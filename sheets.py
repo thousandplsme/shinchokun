@@ -65,6 +65,13 @@ class SheetsClient:
     - メンバー情報・職種マスタは起動時にキャッシュし、API呼び出しを最小化する。
     - 全てのAPI呼び出しに @with_retry を適用し、一時的なエラーを自動リトライする。
     
+    【実務的な設計意図（キャッシュパターン）】
+    Google Sheets API には「1ユーザーあたり1分間に60リクエスト」などの
+    厳しいクオータ制限（利用枠）があります。
+    メンバーがコマンドを叩くたびにシートを読みに行くと、すぐに制限に引っかかります。
+    そのため、変動の少ないデータ（メンバー情報、職種マスタなど）は
+    起動時や特定コマンド実行時のみ取得し、メモリ上の「キャッシュ」から返す設計にしています。
+
     【asyncio.to_thread() とは？】
     同期関数（通常の def で定義された関数）を別スレッドで実行し、
     メインの非同期ループをブロックしないようにする仕組み。
@@ -273,13 +280,21 @@ class SheetsClient:
         val = "TRUE" if is_sent else "FALSE"
         return await self._update_quest_field(week_start, discord_id, quest_title, "sent", val)
 
+    def _sync_get_sheet_data(self, sheet_name: str) -> tuple[gspread.Worksheet, list[dict], list[str]]:
+        """
+        同期ヘルパー: 指定シートのワークシートオブジェクト、全レコード、ヘッダー行を取得する。
+        （to_thread 内の同期コンテキストから呼ばれることを想定）
+        """
+        worksheet = self._spreadsheet.worksheet(sheet_name)
+        records = worksheet.get_all_records()
+        headers = worksheet.row_values(1)
+        return worksheet, records, headers
+
     @with_retry(max_retries=3, base_delay=2.0, exceptions=(gspread.exceptions.APIError,))
     async def update_quest_sent_status_bulk(self, week_start: str, discord_id: int, quest_titles: list[str], is_sent: bool = True):
         """複数のクエストをまとめて送信済み状態に更新する（高速化用）"""
         def _bulk_update():
-            worksheet = self._spreadsheet.worksheet("週次タスク")
-            records = worksheet.get_all_records()
-            headers = worksheet.row_values(1)
+            worksheet, records, headers = self._sync_get_sheet_data("週次タスク")
             
             if "sent" not in headers:
                 logger.warning("⚠️ シートに 'sent' 列が存在しません")
@@ -309,9 +324,7 @@ class SheetsClient:
     async def _update_quest_field(self, week_start: str, discord_id: int, quest_title: str, field_name: str, new_value: str):
         """内部用：特定のクエストの特定フィールドを更新する"""
         def _update():
-            worksheet = self._spreadsheet.worksheet("週次タスク")
-            records = worksheet.get_all_records()
-            headers = worksheet.row_values(1)
+            worksheet, records, headers = self._sync_get_sheet_data("週次タスク")
 
             if field_name not in headers:
                 logger.warning(f"⚠️ シートに '{field_name}' 列が存在しません")

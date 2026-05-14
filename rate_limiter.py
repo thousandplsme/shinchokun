@@ -15,7 +15,7 @@ import asyncio
 import logging
 import functools
 import random
-from typing import TypeVar, Callable, Any
+from typing import TypeVar, Callable, Any, Coroutine
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +35,8 @@ def with_retry(
     max_retries: int = 3,
     base_delay: float = 1.0,
     max_delay: float = 60.0,
-    exceptions: tuple = (Exception,),
-):
+    exceptions: tuple[type[Exception], ...] = (Exception,),
+) -> Callable[[Callable[..., Coroutine[Any, Any, T]]], Callable[..., Coroutine[Any, Any, T]]]:
     """
     指数バックオフ付きリトライデコレータ。
     
@@ -57,6 +57,12 @@ def with_retry(
     複数のクライアントが「同時にリトライ → また同時に失敗」の
     悪循環に陥るのを防ぐ。
 
+    【実務的な設計意図（防衛的プログラミング）】
+    外部API（DiscordやGoogle Sheets）は、「ネットワークの瞬断」や
+    「API側の制限（429 Too Many Requests）」で一時的に失敗することがあります。
+    このデコレータを使うことで、各機能側で都度try-exceptを書く必要がなくなり、
+    システム全体がネットワークエラーに対して堅牢（フォールトトレラント）になります。
+
     Args:
         max_retries: 最大リトライ回数（デフォルト3回）
         base_delay: 基本待ち時間（秒）
@@ -65,11 +71,11 @@ def with_retry(
     
     使用例:
         @with_retry(max_retries=3, base_delay=1.0)
-        async def call_api():
+        async def call_api() -> dict:
             ...
     """
 
-    def decorator(func: Callable) -> Callable:
+    def decorator(func: Callable[..., Coroutine[Any, Any, T]]) -> Callable[..., Coroutine[Any, Any, T]]:
         # functools.wraps は、デコレートされた関数の名前や
         # ドキュメント文字列を保持するためのヘルパー。
         # これがないと、デバッグ時に関数名が 'wrapper' になってしまう。
