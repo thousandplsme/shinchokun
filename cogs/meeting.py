@@ -3,6 +3,16 @@ cogs/meeting.py — 日程調整の応答View（v2.1 改修版）
 
 ミーティング打診のスラッシュコマンドは hub.py に移行。
 このファイルには応答View（参加/別日提案/辞退）のみ残す。
+
+【このファイルで学べること】
+- UI（View/Modal）のみを提供するファイルの構成
+- utils.messaging.send_dm_safely を用いた例外処理の共通化
+
+【実務的な設計意図（UIとロジックの分離）】
+以前はミーティング打診のコマンドロジックと応答UIが同じファイルにありましたが、
+機能拡張に伴い、コマンドの受付口（hub.py）と実際の機能UI（meeting.py）に
+分離しました。このように関心を分離することで、他の場所からも
+MeetingResponseView を再利用しやすくなります。
 """
 
 import logging
@@ -11,6 +21,7 @@ from discord.ext import commands
 
 import config
 from rate_limiter import dm_limiter
+from utils.messaging import send_dm_safely
 
 logger = logging.getLogger(__name__)
 
@@ -33,19 +44,14 @@ class RescheduleModal(discord.ui.Modal, title="📅 別日を提案する"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await self.bot.db.update_meeting_status(self.meeting_id, "rescheduled", self.proposed_date.value)
-        try:
-            from_user = await self.bot.fetch_user(self.from_user_id)
-            if from_user:
-                embed = discord.Embed(title="📅 別日が提案されました", color=config.COLOR_WARNING,
-                    description=f"**{interaction.user.display_name}** さんから別日の提案がありました。")
-                embed.add_field(name="📆 提案日時", value=self.proposed_date.value, inline=False)
-                if self.reason.value:
-                    embed.add_field(name="💬 コメント", value=self.reason.value, inline=False)
-                embed.set_footer(text="しんちょくん 🤖 | 日程調整")
-                async with dm_limiter:
-                    await from_user.send(embed=embed)
-        except Exception as e:
-            logger.error(f"❌ 別日提案通知エラー: {e}")
+        if from_user := await self.bot.fetch_user(self.from_user_id):
+            embed = discord.Embed(title="📅 別日が提案されました", color=config.COLOR_WARNING,
+                description=f"**{interaction.user.display_name}** さんから別日の提案がありました。")
+            embed.add_field(name="📆 提案日時", value=self.proposed_date.value, inline=False)
+            if self.reason.value:
+                embed.add_field(name="💬 コメント", value=self.reason.value, inline=False)
+            embed.set_footer(text="しんちょくん 🤖 | 日程調整")
+            await send_dm_safely(from_user, embed=embed)
         await interaction.response.send_message("✅ 別日を提案しました！", ephemeral=True)
 
 
@@ -67,17 +73,12 @@ class DeclineReasonModal(discord.ui.Modal, title="❌ 辞退理由の入力"):
 
 async def _send_decline(bot, interaction, meeting_id, from_user_id, reason):
     await bot.db.update_meeting_status(meeting_id, "declined", reason)
-    try:
-        from_user = await bot.fetch_user(from_user_id)
-        if from_user:
-            embed = discord.Embed(title="❌ 日程が辞退されました", color=config.COLOR_DANGER,
-                description=f"**{interaction.user.display_name}** さんが辞退しました。")
-            embed.add_field(name="💬 理由", value=reason, inline=False)
-            embed.set_footer(text="しんちょくん 🤖 | 日程調整")
-            async with dm_limiter:
-                await from_user.send(embed=embed)
-    except Exception as e:
-        logger.error(f"❌ 辞退通知エラー: {e}")
+    if from_user := await bot.fetch_user(from_user_id):
+        embed = discord.Embed(title="❌ 日程が辞退されました", color=config.COLOR_DANGER,
+            description=f"**{interaction.user.display_name}** さんが辞退しました。")
+        embed.add_field(name="💬 理由", value=reason, inline=False)
+        embed.set_footer(text="しんちょくん 🤖 | 日程調整")
+        await send_dm_safely(from_user, embed=embed)
     await interaction.response.send_message("✅ 辞退が通知されました。", ephemeral=True)
 
 
@@ -91,20 +92,16 @@ class MeetingResponseView(discord.ui.View):
     @discord.ui.button(label="✅ 参加する", style=discord.ButtonStyle.success)
     async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.bot.db.update_meeting_status(self.meeting_id, "accepted")
-        try:
-            from_user = await self.bot.fetch_user(self.from_user_id)
-            if from_user:
-                meeting = await self.bot.db.get_meeting_request(self.meeting_id)
-                embed = discord.Embed(title="✅ 参加が確定しました！", color=config.COLOR_SUCCESS,
-                    description=f"**{interaction.user.display_name}** さんが参加を承諾しました。")
-                if meeting:
-                    embed.add_field(name="📅 日時", value=meeting["proposed_datetime"], inline=True)
-                    embed.add_field(name="📝 内容", value=meeting["subject"], inline=True)
-                embed.set_footer(text="しんちょくん 🤖 | 日程調整")
-                async with dm_limiter:
-                    await from_user.send(embed=embed)
-        except Exception as e:
-            logger.error(f"❌ 参加通知エラー: {e}")
+        if from_user := await self.bot.fetch_user(self.from_user_id):
+            meeting = await self.bot.db.get_meeting_request(self.meeting_id)
+            embed = discord.Embed(title="✅ 参加が確定しました！", color=config.COLOR_SUCCESS,
+                description=f"**{interaction.user.display_name}** さんが参加を承諾しました。")
+            if meeting:
+                embed.add_field(name="📅 日時", value=meeting["proposed_datetime"], inline=True)
+                embed.add_field(name="📝 内容", value=meeting["subject"], inline=True)
+            embed.set_footer(text="しんちょくん 🤖 | 日程調整")
+            await send_dm_safely(from_user, embed=embed)
+        
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(content="✅ **参加を承諾しました！**", view=self)

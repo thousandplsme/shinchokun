@@ -10,6 +10,17 @@ v2ではクエスト完了状況・EXPランキング・称号情報を追加。
 - EXPランキング（今週の獲得EXP順）を追加
 - 各メンバーの称号・レベルを表示
 - クエスト消化率をメンバー別に表示
+
+【このファイルで学べること】
+- 複数のEmbedを一度に送信するパターン (embeds=[...])
+- プレゼンテーション層（表示ロジック）とデータ取得ロジックの分離
+
+【実務的な設計意図（巨大関数の分割とプレゼンテーション層の分離）】
+週次サマリーのように大量の情報をフォーマットする処理は、1つの関数にまとめると
+数百行に肥大化し（ファットコントローラー）、保守性が著しく低下します。
+これを防ぐため、各セクション（EXPランキング、クエスト消化率、ステータス）ごとに
+Embedを構築するヘルパーメソッド（_build_xxx_embed）へ関数分割しています。
+これにより、特定の表示部分を修正したい場合の影響範囲を局所化できます。
 """
 
 import logging
@@ -21,6 +32,7 @@ from discord.ext import commands
 import config
 from database import now_jst
 from sheets import SheetsClient
+from utils.messaging import send_dm_safely
 
 logger = logging.getLogger(__name__)
 
@@ -34,182 +46,130 @@ class SummaryCog(commands.Cog):
     async def post_weekly_summary(self):
         """
         週次サマリーを投稿する（スケジューラから日曜 21:00 に呼ばれる）。
-        
-        【集計データのソース】
-        - クエスト消化率: Google Sheets の週次タスク + DB の quest_completions
-        - EXPランキング: DB の exp_records（今週分を集計）
-        - 称号・レベル: DB の user_profiles
-        
-        → メンバーから追加入力を求めない設計（負担ゼロ）。
         """
         channel = self.bot.get_channel(config.PROGRESS_CHANNEL_ID)
         if not channel:
             logger.error(f"チャンネルが見つかりません: {config.PROGRESS_CHANNEL_ID}")
             return
 
-        # 今週の月曜日を計算
         today = now_jst()
         monday = today - timedelta(days=today.weekday())
         week_start = monday.strftime("%Y-%m-%d")
         week_end = today.strftime("%Y-%m-%d")
 
-        # Embed作成（複数のEmbedを送信）
         embeds = []
+        embeds.append(await self._build_exp_ranking_embed(week_start, week_end))
+        
+        all_quests = []
+        try:
+            sheets: SheetsClient = self.bot.sheets
+            all_quests = await sheets.get_weekly_quests(week_start)
+            embeds.append(self._build_quest_progress_embed(all_quests))
+        except Exception as e:
+            logger.error(f"⚠️ クエスト消化率取得エラー: {e}")
+            embed_error = discord.Embed(title="⚔️ クエスト消化率", color=config.COLOR_QUEST)
+            embed_error.add_field(name="⚠️ エラー", value="クエストデータの取得に失敗しました。", inline=False)
+            embeds.append(embed_error)
 
-        # ===== Embed 1: ヘッダー + EXPランキング =====
-        embed_header = discord.Embed(
+        embeds.append(await self._build_member_status_embed())
+
+        await channel.send(embeds=embeds)
+        logger.info(f"📊 週間サマリーを投稿しました ({week_start} 〜 {week_end})")
+
+        if all_quests:
+            await self._send_unfinished_quest_dms(all_quests, week_start)
+
+    async def _build_exp_ranking_embed(self, week_start: str, week_end: str) -> discord.Embed:
+        """EXPランキングのEmbedを構築する"""
+        embed = discord.Embed(
             title="📊 週間サマリー",
             description=f"**{week_start}** 〜 **{week_end}**",
             color=config.COLOR_GOLD,
         )
-
-        # EXPランキング取得
         weekly_exp_data = await self.bot.db.get_all_weekly_exp(week_start)
-
         if weekly_exp_data:
             ranking_lines = []
             medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-
             for i, data in enumerate(weekly_exp_data):
                 user = self.bot.get_user(data["discord_id"])
                 name = user.display_name if user else f"ID:{data['discord_id']}"
                 medal = medals[i] if i < len(medals) else f"{i+1}."
-
-                ranking_lines.append(
-                    f"{medal} **{name}** — +{data['weekly_exp']} EXP"
-                )
-
-            embed_header.add_field(
-                name="🏆 今週のEXPランキング",
-                value="\n".join(ranking_lines),
-                inline=False,
-            )
+                ranking_lines.append(f"{medal} **{name}** — +{data['weekly_exp']} EXP")
+            embed.add_field(name="🏆 今週のEXPランキング", value="\n".join(ranking_lines), inline=False)
         else:
-            embed_header.add_field(
-                name="🏆 今週のEXPランキング",
-                value="今週のEXPデータはありません。",
-                inline=False,
-            )
+            embed.add_field(name="🏆 今週のEXPランキング", value="今週のEXPデータはありません。", inline=False)
+        return embed
 
-        embeds.append(embed_header)
+    def _build_quest_progress_embed(self, all_quests: list[dict]) -> discord.Embed:
+        """クエスト消化率のEmbedを構築する"""
+        embed = discord.Embed(title="⚔️ クエスト消化率", color=config.COLOR_QUEST)
+        if all_quests:
+            member_quest_map: dict[int, dict] = {}
+            for q in all_quests:
+                uid = q["discord_id"]
+                if uid not in member_quest_map:
+                    member_quest_map[uid] = {"total": 0, "completed": 0}
+                member_quest_map[uid]["total"] += 1
+                if q.get("status", "") == "完了":
+                    member_quest_map[uid]["completed"] += 1
 
-        # ===== Embed 2: クエスト消化率 =====
-        embed_quests = discord.Embed(
-            title="⚔️ クエスト消化率",
-            color=config.COLOR_QUEST,
-        )
-
-        try:
-            sheets: SheetsClient = self.bot.sheets
-            all_quests = await sheets.get_weekly_quests(week_start)
-
-            if all_quests:
-                # メンバーごとにグルーピング
-                member_quest_map: dict[int, dict] = {}
-                for q in all_quests:
-                    uid = q["discord_id"]
-                    if uid not in member_quest_map:
-                        member_quest_map[uid] = {"total": 0, "completed": 0}
-                    member_quest_map[uid]["total"] += 1
-                    if q.get("status", "") == "完了":
-                        member_quest_map[uid]["completed"] += 1
-
-                for uid, stats in member_quest_map.items():
-                    user = self.bot.get_user(uid)
-                    name = user.display_name if user else f"ID:{uid}"
-                    rate = (stats["completed"] / stats["total"] * 100) if stats["total"] > 0 else 0
-
-                    # プログレスバー
-                    filled = int(rate / 10)
-                    bar = "▓" * filled + "░" * (10 - filled)
-
-                    embed_quests.add_field(
-                        name=f"🔹 {name}",
-                        value=(
-                            f"[{bar}] **{rate:.0f}%**\n"
-                            f"達成: {stats['completed']}/{stats['total']} クエスト"
-                        ),
-                        inline=False,
-                    )
-            else:
-                embed_quests.add_field(
-                    name="📝 クエスト",
-                    value="今週のクエストはありません。",
+            for uid, stats in member_quest_map.items():
+                user = self.bot.get_user(uid)
+                name = user.display_name if user else f"ID:{uid}"
+                rate = (stats["completed"] / stats["total"] * 100) if stats["total"] > 0 else 0
+                filled = int(rate / 10)
+                bar = "▓" * filled + "░" * (10 - filled)
+                embed.add_field(
+                    name=f"🔹 {name}",
+                    value=f"[{bar}] **{rate:.0f}%**\n達成: {stats['completed']}/{stats['total']} クエスト",
                     inline=False,
                 )
-        except Exception as e:
-            logger.error(f"⚠️ クエスト消化率取得エラー: {e}")
-            embed_quests.add_field(
-                name="⚠️ エラー",
-                value="クエストデータの取得に失敗しました。",
-                inline=False,
-            )
+        else:
+            embed.add_field(name="📝 クエスト", value="今週のクエストはありません。", inline=False)
+        return embed
 
-        embeds.append(embed_quests)
-
-        # ===== Embed 3: メンバー称号・レベル一覧 =====
-        embed_titles = discord.Embed(
-            title="🏅 メンバーステータス",
-            color=config.COLOR_PRIMARY,
-        )
-
+    async def _build_member_status_embed(self) -> discord.Embed:
+        """メンバーステータス（称号・レベル）のEmbedを構築する"""
+        embed = discord.Embed(title="🏅 メンバーステータス", color=config.COLOR_PRIMARY)
         profiles = await self.bot.db.get_all_user_profiles()
         if profiles:
             for profile in profiles:
                 user = self.bot.get_user(profile["discord_id"])
                 name = user.display_name if user else f"ID:{profile['discord_id']}"
-
-                embed_titles.add_field(
+                embed.add_field(
                     name=f"🔹 {name}",
-                    value=(
-                        f"🏅 {profile['current_title']}\n"
-                        f"📊 Lv.{profile['level']} | 💰 {profile['total_exp']} EXP"
-                    ),
+                    value=f"🏅 {profile['current_title']}\n📊 Lv.{profile['level']} | 💰 {profile['total_exp']} EXP",
                     inline=True,
                 )
         else:
-            embed_titles.add_field(
-                name="📝 ステータス",
-                value="プロフィールデータがありません。",
-                inline=False,
-            )
+            embed.add_field(name="📝 ステータス", value="プロフィールデータがありません。", inline=False)
+        embed.set_footer(text="しんちょくん 🤖 | 週間サマリー")
+        embed.timestamp = discord.utils.utcnow()
+        return embed
 
-        embed_titles.set_footer(text="しんちょくん 🤖 | 週間サマリー")
-        embed_titles.timestamp = discord.utils.utcnow()
+    async def _send_unfinished_quest_dms(self, all_quests: list[dict], week_start: str):
+        """未完タスクがあるメンバーへ確認DMを送信する"""
+        pending_map: dict[int, list[dict]] = {}
+        for q in all_quests:
+            if q.get("status") in ["未着手", "進行中"]:
+                uid = q["discord_id"]
+                if uid not in pending_map:
+                    pending_map[uid] = []
+                pending_map[uid].append(q)
 
-        embeds.append(embed_titles)
-
-        # 全Embedを送信
-        await channel.send(embeds=embeds)
-        logger.info(f"📊 週間サマリーを投稿しました ({week_start} 〜 {week_end})")
-
-        # ===== 未完タスク確認 DM 送信 =====
-        if all_quests:
-            pending_map: dict[int, list[dict]] = {}
-            for q in all_quests:
-                if q.get("status") in ["未着手", "進行中"]:
-                    uid = q["discord_id"]
-                    if uid not in pending_map:
-                        pending_map[uid] = []
-                    pending_map[uid].append(q)
-
-            for uid, p_quests in pending_map.items():
-                user = self.bot.get_user(uid)
-                if user:
-                    view = UnfinishedQuestDMView(self.bot, p_quests, week_start)
-                    embed = discord.Embed(
-                        title="⚠️ 未完了クエストの確認",
-                        description=(
-                            "今週のクエストで未完了のものが残っています。\n"
-                            "月曜 09:00 までに下のメニューから「延長（持ち越し）」または「辞退」を選択してください。\n"
-                            "※回答がない場合、自動的に「延長」として処理されます。"
-                        ),
-                        color=discord.Color.orange()
-                    )
-                    try:
-                        await user.send(embed=embed, view=view)
-                    except Exception as e:
-                        logger.error(f"❌ {user.display_name} への未完タスク確認DM送信失敗: {e}")
+        for uid, p_quests in pending_map.items():
+            if user := self.bot.get_user(uid):
+                view = UnfinishedQuestDMView(self.bot, p_quests, week_start)
+                embed = discord.Embed(
+                    title="⚠️ 未完了クエストの確認",
+                    description=(
+                        "今週のクエストで未完了のものが残っています。\n"
+                        "月曜 09:00 までに下のメニューから「延長（持ち越し）」または「辞退」を選択してください。\n"
+                        "※回答がない場合、自動的に「延長」として処理されます。"
+                    ),
+                    color=discord.Color.orange()
+                )
+                await send_dm_safely(user, embed=embed, view=view)
 
 
 # ============================================
@@ -247,20 +207,16 @@ class QuestExtendModal(discord.ui.Modal, title="▶️ クエストを来週に�
             await interaction.followup.send("⚠️ スプレッドシートの更新に失敗しました。", ephemeral=True)
             return
 
-        leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
-        if leader:
-            embed = discord.Embed(
-                title="▶️ クエスト延長の通知",
-                description=f"**{interaction.user.display_name}** さんがクエストを来週に延長しました。",
-                color=discord.Color.orange()
-            )
-            embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
-            embed.add_field(name="理由", value=self.reason.value, inline=False)
-            embed.set_thumbnail(url=interaction.user.display_avatar.url)
-            try:
-                await leader.send(embed=embed)
-            except Exception:
-                pass
+            if leader := self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None:
+                embed = discord.Embed(
+                    title="▶️ クエスト延長の通知",
+                    description=f"**{interaction.user.display_name}** さんがクエストを来週に延長しました。",
+                    color=discord.Color.orange()
+                )
+                embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
+                embed.add_field(name="理由", value=self.reason.value, inline=False)
+                embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                await send_dm_safely(leader, embed=embed)
 
         await interaction.followup.send("✅ クエストを来週に延長し、リーダーに通知しました。", ephemeral=True)
 
@@ -290,20 +246,16 @@ class SummaryQuestDeclineModal(discord.ui.Modal, title="⏸️ クエストを�
             await interaction.followup.send("⚠️ スプレッドシートの更新に失敗しました。", ephemeral=True)
             return
 
-        leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
-        if leader:
-            embed = discord.Embed(
-                title="⏸️ クエスト辞退の通知",
-                description=f"**{interaction.user.display_name}** さんがクエストを辞退しました。",
-                color=discord.Color.red()
-            )
-            embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
-            embed.add_field(name="理由", value=self.reason.value, inline=False)
-            embed.set_thumbnail(url=interaction.user.display_avatar.url)
-            try:
-                await leader.send(embed=embed)
-            except Exception:
-                pass
+            if leader := self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None:
+                embed = discord.Embed(
+                    title="⏸️ クエスト辞退の通知",
+                    description=f"**{interaction.user.display_name}** さんがクエストを辞退しました。",
+                    color=discord.Color.red()
+                )
+                embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
+                embed.add_field(name="理由", value=self.reason.value, inline=False)
+                embed.set_thumbnail(url=interaction.user.display_avatar.url)
+                await send_dm_safely(leader, embed=embed)
 
         await interaction.followup.send("✅ クエストを辞退し、リーダーに通知しました。", ephemeral=True)
 
