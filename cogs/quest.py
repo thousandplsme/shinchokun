@@ -10,6 +10,14 @@ cogs/quest.py — クエスト自動配信＆完了報告システム
 - DM送信時のRate Limit対策
 - Google Sheets → Discord の連携フロー
 - ephemeral メッセージ（本人だけに見えるメッセージ）
+
+【実務的な設計意図（バッチ処理のエラーハンドリングと関数分割）】
+週次クエスト配信のような「複数人への一括送信（バッチ処理）」では、
+1人のユーザーへの送信失敗（ブロックなどによる discord.Forbidden）が原因で
+ループ全体が停止し、他のユーザーへ配信されない事態を防ぐ必要があります。
+そのため、各ユーザーへの処理は個別に try-except で囲み、エラーを記録して処理を続行します。
+また、処理が肥大化しやすいバッチ処理に対してSRP（単一責任の原則）を適用し、
+「データ取得」「グループ化」「送信」といったフェーズごとに関数を分割しています。
 """
 
 import logging
@@ -20,6 +28,7 @@ from discord import app_commands
 import config
 from rate_limiter import dm_limiter
 from gamification import ExpManager
+from utils.messaging import send_dm_safely
 
 logger = logging.getLogger(__name__)
 
@@ -472,14 +481,6 @@ class QuestCog(commands.Cog):
     async def deliver_weekly_quests(self):
         """
         週次クエストを配信する（スケジューラから毎週月曜 09:00 に呼ばれる）。
-        
-        【処理フロー】
-        1. Google Sheets から今週のタスクとメンバー情報を取得
-        2. メンバーごとにクエストをフィルタリング
-        3. autonomy_level に応じてDMの内容を変える:
-           - high: 大目標のみ
-           - low: 大目標 + サブタスク（ヒント）付き
-        4. 完了ボタン付きDMを送信
         """
         logger.info("📜 週次クエスト配信を開始...")
 
@@ -490,57 +491,65 @@ class QuestCog(commands.Cog):
 
         try:
             week_start = sheets.get_current_week_start()
-            
-            # --- 先週の未回答クエストを自動延長 ---
-            try:
-                last_week = sheets.get_last_week_start()
-                last_week_quests = await sheets.get_weekly_quests(last_week)
-                for q in last_week_quests:
-                    if q.get("status") in ["未着手", "進行中"]:
-                        await sheets.update_quest_status(last_week, q["discord_id"], q["quest_title"], "延長")
-                        await sheets.duplicate_quest_to_next_week(last_week, q["discord_id"], q["quest_title"], week_start)
-                        # リーダーへ通知
-                        leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
-                        if leader:
-                            member = self.bot.get_user(q["discord_id"])
-                            name = member.display_name if member else f"ID:{q['discord_id']}"
-                            await leader.send(f"⚠️ **自動延長処理**: {name} さんのタスク『{q['quest_title']}』を未回答のため強制延長しました。")
-            except Exception as ex:
-                logger.error(f"❌ 自動延長処理に失敗: {ex}")
-            # -----------------------------------
-            
+            await self._auto_extend_last_week_quests(sheets, week_start)
         except Exception as e:
             logger.error(f"❌ 週開始日の取得に失敗: {e}")
-            await self.bot.notify_leader_error("クエスト配信: 週開始日取得", e)
+            await getattr(self.bot, "notify_leader_error", lambda *args: None)("クエスト配信: 週開始日取得", e)
             return
 
-        # Google Sheets からデータ取得
+        quests = await self._fetch_weekly_quests(sheets, week_start)
+        if not quests:
+            return
+
+        member_quests = self._group_quests_by_member(quests)
+        members = sheets.get_members()
+        await self._deliver_to_members(sheets, week_start, members, member_quests)
+
+    async def _auto_extend_last_week_quests(self, sheets, week_start: str):
+        """先週の未回答クエストを自動延長する"""
+        try:
+            last_week = sheets.get_last_week_start()
+            last_week_quests = await sheets.get_weekly_quests(last_week)
+            for q in last_week_quests:
+                if q.get("status") in ["未着手", "進行中"]:
+                    await sheets.update_quest_status(last_week, q["discord_id"], q["quest_title"], "延長")
+                    await sheets.duplicate_quest_to_next_week(last_week, q["discord_id"], q["quest_title"], week_start)
+                    # リーダーへ通知
+                    leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
+                    if leader:
+                        member = self.bot.get_user(q["discord_id"])
+                        name = member.display_name if member else f"ID:{q['discord_id']}"
+                        await send_dm_safely(leader, content=f"⚠️ **自動延長処理**: {name} さんのタスク『{q['quest_title']}』を未回答のため強制延長しました。")
+        except Exception as ex:
+            logger.error(f"❌ 自動延長処理に失敗: {ex}")
+
+    async def _fetch_weekly_quests(self, sheets, week_start: str) -> list[dict]:
+        """Google Sheets から今週のクエストを取得する"""
         try:
             quests = await sheets.get_weekly_quests(week_start)
+            if not quests:
+                logger.info(f"⚠️ {week_start} のクエストが見つかりません。配信をスキップ。")
+                return []
+            return quests
         except Exception as e:
             logger.error(f"❌ クエストデータの取得に失敗: {e}")
-            await self.bot.notify_leader_error("クエスト配信: データ取得", e)
-            return
+            await getattr(self.bot, "notify_leader_error", lambda *args: None)("クエスト配信: データ取得", e)
+            return []
 
-        if not quests:
-            logger.info(f"⚠️ {week_start} のクエストが見つかりません。配信をスキップ。")
-            return
-
-        members = sheets.get_members()
-
-        # メンバーごとにクエストをグルーピング
-        # defaultdict 的な処理: member_id → [quest1, quest2, ...]
+    def _group_quests_by_member(self, quests: list[dict]) -> dict[int, list[dict]]:
+        """メンバーごとに未送信クエストをグルーピングする"""
         member_quests: dict[int, list[dict]] = {}
         for q in quests:
-            # 未送信（sent = False）のものだけを対象とする
             if q.get("sent", False):
                 continue
             uid = q["discord_id"]
             if uid not in member_quests:
                 member_quests[uid] = []
             member_quests[uid].append(q)
+        return member_quests
 
-        # 各メンバーにDMを送信
+    async def _deliver_to_members(self, sheets, week_start: str, members: list[dict], member_quests: dict[int, list[dict]]):
+        """各メンバーへクエストをDMで配信する（エラー耐性を持たせたバッチ処理）"""
         sent_count = 0
         for member_info in members:
             uid = member_info["discord_id"]
@@ -556,27 +565,22 @@ class QuestCog(commands.Cog):
                     logger.warning(f"⚠️ ユーザーが見つかりません: {uid}")
                     continue
 
-                # DM Embed を構築（メンバー別メッセージ対応）
                 embed = self._build_quest_embed(user_quests, autonomy, week_start, uid)
-
-                # 完了ボタン付きで送信（Rate Limiter で間隔制御）
                 view = QuestView(self.bot)
-                async with dm_limiter:
-                    await user.send(embed=embed, view=view)
+                
+                success = await send_dm_safely(user, embed=embed, view=view)
+                
+                if success:
+                    try:
+                        titles = [q["quest_title"] for q in user_quests]
+                        await sheets.update_quest_sent_status_bulk(week_start, uid, titles, True)
+                    except Exception as e:
+                        logger.error(f"⚠️ sentフラグ一括更新失敗: {uid} - {e}")
 
-                # 送信成功したクエストの sent フラグを TRUE に一括更新
-                try:
-                    titles = [q["quest_title"] for q in user_quests]
-                    await sheets.update_quest_sent_status_bulk(week_start, uid, titles, True)
-                except Exception as e:
-                    logger.error(f"⚠️ sentフラグ一括更新失敗: {uid} - {e}")
 
-                sent_count += 1
-                logger.info(f"📩 クエスト配信: {user.name} ({len(user_quests)}件)")
 
-            except discord.Forbidden:
-                logger.warning(f"⚠️ DM送信不可: {uid}")
             except Exception as e:
+                # 1人の失敗で全体のループを止めないための安全なキャッチ
                 logger.error(f"❌ クエスト配信エラー: {uid} - {e}")
 
         logger.info(f"✅ クエスト配信完了: {sent_count}人に送信")
