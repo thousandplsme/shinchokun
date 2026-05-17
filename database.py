@@ -471,6 +471,20 @@ class Database:
             (discord_id, amount, reason, now_jst().isoformat()),
         )
 
+    async def replace_all_exp_logs(self, logs: list[dict]):
+        """
+        全てのEXP獲得記録を削除し、指定されたログで上書きする（データ同期用）。
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM exp_records")
+            for log in logs:
+                await db.execute(
+                    """INSERT INTO exp_records (discord_id, amount, reason, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (log["discord_id"], log["amount"], log["reason"], log.get("timestamp") or now_jst().isoformat()),
+                )
+            await db.commit()
+
     async def get_weekly_exp(self, discord_id: int, week_start: str) -> int:
         """
         指定ユーザーの指定週のEXP合計を取得する。

@@ -100,7 +100,7 @@ class SummaryCog(commands.Cog):
             embed.add_field(name="🏆 今週のEXPランキング", value="今週のEXPデータはありません。", inline=False)
         return embed
 
-        def _build_quest_progress_embed(self, all_quests: list[dict]) -> discord.Embed:
+    def _build_quest_progress_embed(self, all_quests: list[dict]) -> discord.Embed:
         """クエスト消化率のEmbedを構築する"""
         embed = discord.Embed(title="⚔️ クエスト消化率", color=config.COLOR_QUEST)
         if all_quests:

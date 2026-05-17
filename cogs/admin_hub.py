@@ -401,6 +401,12 @@ class AdminSyncSelectView(discord.ui.View):
             )
             embed.set_footer(text="しんちょくん 🤖 | EXP同期")
             await interaction.followup.send(embed=embed, ephemeral=True)
+            
+            try:
+                await self.bot.db.replace_all_exp_logs([])
+            except Exception as e:
+                logger.error(f"❌ exp_recordsリセットエラー: {e}")
+                
             logger.info(f"🔄 EXPログ空 → {reset_count}人リセット")
             return
 
@@ -444,6 +450,13 @@ class AdminSyncSelectView(discord.ui.View):
         embed.add_field(name="📊 同期結果", value="\n".join(results) or "なし", inline=False)
         embed.set_footer(text="しんちょくん 🤖 | EXP同期")
         await interaction.followup.send(embed=embed, ephemeral=True)
+        
+        try:
+            await self.bot.db.replace_all_exp_logs(logs)
+            logger.info("🔄 DBのexp_recordsもSheetsの内容で上書きしました。")
+        except Exception as e:
+            logger.error(f"❌ exp_records上書きエラー: {e}")
+            
         logger.info(f"🔄 EXP同期(Sheets)完了: {len(totals)}人")
 
     @discord.ui.button(label="クエスト同期", style=discord.ButtonStyle.primary)
