@@ -506,22 +506,45 @@ class QuestCog(commands.Cog):
         await self._deliver_to_members(sheets, week_start, members, member_quests)
 
     async def _auto_extend_last_week_quests(self, sheets, week_start: str):
-        """先週の未回答クエストを自動延長する"""
+        """
+        先週の未完了クエストを今週に自動延長（複製）する。
+
+        【ステータス判定ロジック（空欄=延長方式）】
+        - 「完了」→ スキップ
+        - 「辞退」→ スキップ
+        - それ以外（空欄・未着手・進行中など）→ 延長対象として今週に複製
+        """
         try:
             last_week = sheets.get_last_week_start()
             last_week_quests = await sheets.get_weekly_quests(last_week)
+            extended_count = 0
+
             for q in last_week_quests:
-                if q.get("status") in ["未着手", "進行中"]:
-                    await sheets.update_quest_status(last_week, q["discord_id"], q["quest_title"], "延長")
-                    await sheets.duplicate_quest_to_next_week(last_week, q["discord_id"], q["quest_title"], week_start)
+                st = q.get("status", "").strip()
+                if st in ["完了", "辞退"]:
+                    continue  # 完了・辞退は対象外
+
+                # 今週に複製（重複チェックは sheets 側で実施）
+                result = await sheets.duplicate_quest_to_next_week(
+                    last_week, q["discord_id"], q["quest_title"], week_start
+                )
+                if result:
+                    extended_count += 1
                     # リーダーへ通知
                     leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
                     if leader:
                         member = self.bot.get_user(q["discord_id"])
                         name = member.display_name if member else f"ID:{q['discord_id']}"
-                        await send_dm_safely(leader, content=f"⚠️ **自動延長処理**: {name} さんのタスク『{q['quest_title']}』を未回答のため強制延長しました。")
+                        await send_dm_safely(
+                            leader,
+                            content=f"⚠️ **自動延長**: {name} さんの『{q['quest_title']}』を今週に持ち越しました。"
+                        )
+
+            if extended_count > 0:
+                logger.info(f"🔄 自動延長処理完了: {extended_count}件を今週に複製")
         except Exception as ex:
             logger.error(f"❌ 自動延長処理に失敗: {ex}")
+            await getattr(self.bot, "notify_leader_error", lambda *a: None)("自動延長処理", ex)
 
     async def _fetch_weekly_quests(self, sheets, week_start: str) -> list[dict]:
         """Google Sheets から今週のクエストを取得する"""

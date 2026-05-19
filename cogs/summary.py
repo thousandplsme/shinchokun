@@ -189,7 +189,8 @@ class SummaryCog(commands.Cog):
         """未完タスクがあるメンバーへ確認DMを送信する"""
         pending_map: dict[int, list[dict]] = {}
         for q in all_quests:
-            if q.get("status") in ["未着手", "進行中"]:
+            st = q.get("status", "").strip()
+            if st not in ["完了", "辞退"]:  # 空欄・未着手・進行中 → すべて未完了
                 uid = q["discord_id"]
                 if uid not in pending_map:
                     pending_map[uid] = []
@@ -202,8 +203,8 @@ class SummaryCog(commands.Cog):
                     title="⚠️ 未完了クエストの確認",
                     description=(
                         "今週のクエストで未完了のものが残っています。\n"
-                        "月曜 09:00 までに下のメニューから「延長（持ち越し）」または「辞退」を選択してください。\n"
-                        "※回答がない場合、自動的に「延長」として処理されます。"
+                        "月曜 09:00 までに下のメニューから「辞退」を選択してください。\n"
+                        "※回答がない場合、自動的に来週へ持ち越されます。"
                     ),
                     color=discord.Color.orange()
                 )
@@ -299,27 +300,13 @@ class QuestExtendModal(discord.ui.Modal, title="▶️ クエストを来週に�
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        
-        try:
-            # 今週のステータスを「延長」に
-            await self.bot.sheets.update_quest_status(
-                self.week_start, interaction.user.id, self.quest_title, "延長"
-            )
-            # 来週に複製
-            next_week = self.bot.sheets.get_next_week_start(self.week_start)
-            await self.bot.sheets.duplicate_quest_to_next_week(
-                self.week_start, interaction.user.id, self.quest_title, next_week
-            )
-        except Exception as e:
-            logger.error(f"❌ 延長処理エラー: {e}")
-            await interaction.followup.send("⚠️ スプレッドシートの更新に失敗しました。", ephemeral=True)
-            return
 
-        # リーダーへの通知（try-except の外に配置）
+        # 延長 = ステータスを空欄のまま残す（月曜の自動処理で今週に複製される）
+        # リーダーへ通知のみ行う
         if leader := self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None:
             embed = discord.Embed(
                 title="▶️ クエスト延長の通知",
-                description=f"**{interaction.user.display_name}** さんがクエストを来週に延長しました。",
+                description=f"**{interaction.user.display_name}** さんがクエストの延長を希望しました。",
                 color=discord.Color.orange()
             )
             embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
@@ -327,7 +314,11 @@ class QuestExtendModal(discord.ui.Modal, title="▶️ クエストを来週に�
             embed.set_thumbnail(url=interaction.user.display_avatar.url)
             await send_dm_safely(leader, embed=embed)
 
-        await interaction.followup.send("✅ クエストを来週に延長し、リーダーに通知しました。", ephemeral=True)
+        await interaction.followup.send(
+            "✅ リーダーに延長の意向を通知しました。\n"
+            "月曜日にクエストが自動的に来週へ持ち越されます。",
+            ephemeral=True
+        )
 
 
 class SummaryQuestDeclineModal(discord.ui.Modal, title="⏸️ クエストを辞退する"):

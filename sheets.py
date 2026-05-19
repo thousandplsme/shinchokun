@@ -430,15 +430,26 @@ class SheetsClient:
     async def duplicate_quest_to_next_week(self, week_start: str, discord_id: int, quest_title: str, new_week_start: str) -> bool:
         """
         指定したクエストの行をコピーし、week_startを更新して新しい行として追加する。
+        既に同じ week_start + discord_id + quest_title が存在する場合はスキップ（二重複製防止）。
         """
         def _duplicate():
             worksheet = self._spreadsheet.worksheet("週次タスク")
             records = worksheet.get_all_records()
-            
+
+            # 重複チェック: 既に今週に同じクエストが存在するか
+            for r in records:
+                if (
+                    str(r.get("week_start", "")).strip() == new_week_start
+                    and int(r.get("discord_id", 0)) == discord_id
+                    and r.get("quest_title", "") == quest_title
+                ):
+                    return None  # 既に存在 → スキップ
+
+            # コピー元を検索
             target_row = None
             for r in records:
                 if (
-                    str(r.get("week_start", "")) == week_start
+                    str(r.get("week_start", "")).strip() == week_start
                     and int(r.get("discord_id", 0)) == discord_id
                     and r.get("quest_title", "") == quest_title
                 ):
@@ -452,14 +463,17 @@ class SheetsClient:
             detail = str(target_row.get("quest_detail", ""))
             exp = int(target_row.get("exp_reward", 10))
             
-            # 新しい行を追加
+            # 新しい行を追加（ステータスは空欄、sent=FALSE）
             worksheet.append_row(
-                [new_week_start, str(discord_id), quest_title, detail, exp, "未着手", "FALSE"],
+                [new_week_start, str(discord_id), quest_title, detail, exp, "", "FALSE"],
                 value_input_option="USER_ENTERED",
             )
             return True
 
         result = await asyncio.to_thread(_duplicate)
+        if result is None:
+            logger.info(f"⏭️ クエスト延長スキップ（既存）: {quest_title} ({new_week_start})")
+            return False
         if result:
             logger.info(f"📝 クエスト延長複製: {quest_title} ({week_start} -> {new_week_start})")
         return result
