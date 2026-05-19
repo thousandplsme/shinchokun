@@ -150,7 +150,14 @@ class ShinchokuBot(commands.Bot):
             )
             logger.info(f"  📊 週次サマリージョブ登録: {config.SUMMARY_DAY} {config.SUMMARY_HOUR}:00")
 
-        # 日程調整の期限切れチェック（毎時）
+            # 土曜 09:00 に進捗なしメンバーへ自動声掛け
+            self.scheduler.add_job(
+                summary_cog.send_saturday_reminder,
+                CronTrigger(day_of_week="sat", hour=9, minute=0, timezone=config.TIMEZONE),
+                id="saturday_reminder", replace_existing=True,
+            )
+            logger.info("  📨 土曜リマインダージョブ登録: sat 9:00")
+
         scheduler_cog = self.get_cog("SchedulerCog")
         if scheduler_cog:
             self.scheduler.add_job(

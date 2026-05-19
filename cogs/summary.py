@@ -24,7 +24,7 @@ Embedを構築するヘルパーメソッド（_build_xxx_embed）へ関数分�
 """
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ext import commands
@@ -35,6 +35,8 @@ from sheets import SheetsClient
 from utils.messaging import send_dm_safely
 
 logger = logging.getLogger(__name__)
+
+JST = timezone(timedelta(hours=9))
 
 
 class SummaryCog(commands.Cog):
@@ -80,24 +82,52 @@ class SummaryCog(commands.Cog):
             await self._send_unfinished_quest_dms(all_quests, week_start)
 
     async def _build_exp_ranking_embed(self, week_start: str, week_end: str) -> discord.Embed:
-        """EXPランキングのEmbedを構築する"""
+        """
+        EXPランキングのEmbedを構築する。
+        データソースはスプレッドシートのEXPログ（正のデータ源）。
+        """
         embed = discord.Embed(
             title="📊 週間サマリー",
             description=f"**{week_start}** 〜 **{week_end}**",
             color=config.COLOR_GOLD,
         )
-        weekly_exp_data = await self.bot.db.get_all_weekly_exp(week_start)
-        if weekly_exp_data:
-            ranking_lines = []
-            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-            for i, data in enumerate(weekly_exp_data):
-                user = self.bot.get_user(data["discord_id"])
-                name = user.display_name if user else f"ID:{data['discord_id']}"
-                medal = medals[i] if i < len(medals) else f"{i+1}."
-                ranking_lines.append(f"{medal} **{name}** — +{data['weekly_exp']} EXP")
-            embed.add_field(name="🏆 今週のEXPランキング", value="\n".join(ranking_lines), inline=False)
-        else:
-            embed.add_field(name="🏆 今週のEXPランキング", value="今週のEXPデータはありません。", inline=False)
+
+        try:
+            sheets = getattr(self.bot, "sheets", None)
+            if sheets:
+                all_logs = await sheets.get_all_exp_logs()
+
+                # 今週の期間でフィルタリング
+                week_end_dt = datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=7)
+                week_end_str = week_end_dt.strftime("%Y-%m-%d")
+
+                weekly_totals: dict[int, int] = {}
+                for log in all_logs:
+                    ts = log.get("timestamp", "")
+                    if ts >= week_start and ts < week_end_str:
+                        uid = log["discord_id"]
+                        weekly_totals[uid] = weekly_totals.get(uid, 0) + log["amount"]
+
+                # 降順ソート
+                sorted_ranking = sorted(weekly_totals.items(), key=lambda x: x[1], reverse=True)
+
+                if sorted_ranking:
+                    ranking_lines = []
+                    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+                    for i, (uid, exp) in enumerate(sorted_ranking):
+                        user = self.bot.get_user(uid)
+                        name = user.display_name if user else f"ID:{uid}"
+                        medal = medals[i] if i < len(medals) else f"{i+1}."
+                        ranking_lines.append(f"{medal} **{name}** — +{exp} EXP")
+                    embed.add_field(name="🏆 今週のEXPランキング", value="\n".join(ranking_lines), inline=False)
+                else:
+                    embed.add_field(name="🏆 今週のEXPランキング", value="今週のEXPデータはありません。", inline=False)
+            else:
+                embed.add_field(name="🏆 今週のEXPランキング", value="Google Sheets が未接続です。", inline=False)
+        except Exception as e:
+            logger.error(f"⚠️ EXPランキング構築エラー: {e}")
+            embed.add_field(name="🏆 今週のEXPランキング", value="EXPデータの取得に失敗しました。", inline=False)
+
         return embed
 
     def _build_quest_progress_embed(self, all_quests: list[dict]) -> discord.Embed:
@@ -178,6 +208,76 @@ class SummaryCog(commands.Cog):
                     color=discord.Color.orange()
                 )
                 await send_dm_safely(user, embed=embed, view=view)
+                logger.info(f"📨 未完了クエスト確認DM送信: {user.display_name} ({len(p_quests)}件)")
+
+    # ============================================
+    # 土曜日の自動声掛け
+    # ============================================
+
+    async def send_saturday_reminder(self):
+        """
+        土曜 09:00 にスケジューラから呼ばれる。
+        今週のクエストで「完了」が1件もないメンバーにDMで声掛けする。
+        """
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            logger.warning("⚠️ 土曜リマインダー: Google Sheets 未接続のためスキップ")
+            return
+
+        try:
+            week_start = sheets.get_current_week_start()
+            all_quests = await sheets.get_weekly_quests(week_start)
+        except Exception as e:
+            logger.error(f"❌ 土曜リマインダー: クエスト取得エラー: {e}")
+            return
+
+        if not all_quests:
+            logger.info("📭 土曜リマインダー: 今週のクエストがないためスキップ")
+            return
+
+        # メンバーごとの完了状況を集計
+        member_status: dict[int, dict] = {}
+        for q in all_quests:
+            uid = q["discord_id"]
+            if uid not in member_status:
+                member_status[uid] = {"total": 0, "completed": 0, "quests": []}
+            member_status[uid]["total"] += 1
+            if q.get("status") == "完了":
+                member_status[uid]["completed"] += 1
+            elif q.get("status") in ["未着手", "進行中", ""]:
+                member_status[uid]["quests"].append(q["quest_title"])
+
+        reminded_count = 0
+        for uid, status in member_status.items():
+            if status["completed"] == 0 and status["total"] > 0:
+                user = self.bot.get_user(uid)
+                if not user:
+                    continue
+
+                quest_list = "\n".join(f"・{t}" for t in status["quests"][:5])
+
+                embed = discord.Embed(
+                    title="📋 今週のクエスト状況のお知らせ",
+                    description=(
+                        "今週のクエストがまだ完了していないようです。\n"
+                        "もし困っていることがあれば、クエストDMの「❓ もっと詳しく」ボタンから\n"
+                        "リーダーに気軽に質問できます！\n\n"
+                        "難しい場合は「⏸️ 辞退する」も選べますので、無理せずご活用ください 🙏"
+                    ),
+                    color=discord.Color.blue()
+                )
+                embed.add_field(
+                    name="📝 未完了のクエスト",
+                    value=quest_list or "（情報を取得できませんでした）",
+                    inline=False,
+                )
+                embed.set_footer(text="しんちょくん 🤖 | 週末リマインダー")
+
+                await send_dm_safely(user, embed=embed)
+                reminded_count += 1
+                logger.info(f"📨 土曜リマインダー送信: {user.display_name}")
+
+        logger.info(f"✅ 土曜リマインダー完了: {reminded_count}人に送信")
 
 
 # ============================================
@@ -215,16 +315,17 @@ class QuestExtendModal(discord.ui.Modal, title="▶️ クエストを来週に�
             await interaction.followup.send("⚠️ スプレッドシートの更新に失敗しました。", ephemeral=True)
             return
 
-            if leader := self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None:
-                embed = discord.Embed(
-                    title="▶️ クエスト延長の通知",
-                    description=f"**{interaction.user.display_name}** さんがクエストを来週に延長しました。",
-                    color=discord.Color.orange()
-                )
-                embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
-                embed.add_field(name="理由", value=self.reason.value, inline=False)
-                embed.set_thumbnail(url=interaction.user.display_avatar.url)
-                await send_dm_safely(leader, embed=embed)
+        # リーダーへの通知（try-except の外に配置）
+        if leader := self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None:
+            embed = discord.Embed(
+                title="▶️ クエスト延長の通知",
+                description=f"**{interaction.user.display_name}** さんがクエストを来週に延長しました。",
+                color=discord.Color.orange()
+            )
+            embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
+            embed.add_field(name="理由", value=self.reason.value, inline=False)
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            await send_dm_safely(leader, embed=embed)
 
         await interaction.followup.send("✅ クエストを来週に延長し、リーダーに通知しました。", ephemeral=True)
 
@@ -254,16 +355,17 @@ class SummaryQuestDeclineModal(discord.ui.Modal, title="⏸️ クエストを�
             await interaction.followup.send("⚠️ スプレッドシートの更新に失敗しました。", ephemeral=True)
             return
 
-            if leader := self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None:
-                embed = discord.Embed(
-                    title="⏸️ クエスト辞退の通知",
-                    description=f"**{interaction.user.display_name}** さんがクエストを辞退しました。",
-                    color=discord.Color.red()
-                )
-                embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
-                embed.add_field(name="理由", value=self.reason.value, inline=False)
-                embed.set_thumbnail(url=interaction.user.display_avatar.url)
-                await send_dm_safely(leader, embed=embed)
+        # リーダーへの通知（try-except の外に配置）
+        if leader := self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None:
+            embed = discord.Embed(
+                title="⏸️ クエスト辞退の通知",
+                description=f"**{interaction.user.display_name}** さんがクエストを辞退しました。",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
+            embed.add_field(name="理由", value=self.reason.value, inline=False)
+            embed.set_thumbnail(url=interaction.user.display_avatar.url)
+            await send_dm_safely(leader, embed=embed)
 
         await interaction.followup.send("✅ クエストを辞退し、リーダーに通知しました。", ephemeral=True)
 
