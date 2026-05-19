@@ -354,6 +354,83 @@ class AdminHubView(discord.ui.View):
         view = FixStatusUserSelectView(self.bot)
         await interaction.response.send_message("✏️ **ステータスの手動修正**\n修正したいメンバーを選択してください。", view=view, ephemeral=True)
 
+    @discord.ui.button(label="🔁 未完了クエスト再配信", style=discord.ButtonStyle.success, custom_id="admin_hub_resend_pending", row=2)
+    async def resend_pending_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """sent=TRUE だが status が空欄のクエストを再配信する（延長分の救済用）"""
+        if not await self._check_admin(interaction): return
+        await interaction.response.defer(ephemeral=True)
+
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
+        quest_cog = self.bot.get_cog("QuestCog")
+        if not quest_cog:
+            await interaction.followup.send("⚠️ QuestCogが読み込まれていません。", ephemeral=True)
+            return
+
+        try:
+            week_start = sheets.get_current_week_start()
+            quests = await sheets.get_weekly_quests(week_start)
+
+            # sent=TRUE かつ status が完了・辞退以外（空欄・未着手・進行中）
+            pending = [
+                q for q in quests
+                if q.get("sent", False) and q.get("status", "").strip() not in ["完了", "辞退"]
+            ]
+
+            if not pending:
+                await interaction.followup.send("✅ 再配信対象のクエストはありません。", ephemeral=True)
+                return
+
+            from cogs.quest import QuestView
+            member_quests: dict[int, list[dict]] = {}
+            for q in pending:
+                uid = q["discord_id"]
+                if uid not in member_quests:
+                    member_quests[uid] = []
+                member_quests[uid].append(q)
+
+            sent_count = 0
+            for uid, uq in member_quests.items():
+                try:
+                    user = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+                    member_info = sheets.get_member(uid)
+                    autonomy = member_info.get("autonomy_level", "low") if member_info else "low"
+
+                    embed = discord.Embed(
+                        title="🔁 未完了クエストのリマインド",
+                        description=(
+                            f"**{week_start}** 〜 の未完了クエストです。\n"
+                            f"完了したら **「✅ クエスト完了！」** ボタンを押してください！"
+                        ),
+                        color=0xE67E22,
+                    )
+                    for i, quest in enumerate(uq[:5], 1):
+                        title = quest["quest_title"]
+                        detail = quest.get("quest_detail", "")
+                        exp = quest["exp_reward"]
+                        if autonomy == "high":
+                            value = f"⭐ 報酬: **+{exp} EXP**"
+                        else:
+                            value = f"📝 ヒント: {detail}\n⭐ 報酬: **+{exp} EXP**" if detail else f"⭐ 報酬: **+{exp} EXP**"
+                        embed.add_field(name=f"**Quest {i}**: {title}", value=value, inline=False)
+                    embed.set_footer(text="しんちょくん 🤖 | 未完了クエスト再配信")
+
+                    view = QuestView(self.bot)
+                    await user.send(embed=embed, view=view)
+                    sent_count += 1
+                except Exception as e:
+                    logger.error(f"❌ 再配信エラー ({uid}): {e}")
+
+            await interaction.followup.send(
+                f"✅ 未完了クエストを **{sent_count}人** に再配信しました。\n（対象: sent=TRUE & status≠完了/辞退 のクエスト {len(pending)}件）",
+                ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"❌ 未完了クエスト再配信エラー: {e}")
+            await interaction.followup.send(f"⚠️ 再配信に失敗しました: {e}", ephemeral=True)
 
 class AdminSyncSelectView(discord.ui.View):
     def __init__(self, bot: commands.Bot):
