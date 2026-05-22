@@ -101,13 +101,14 @@ class QuestView(discord.ui.View):
             await interaction.followup.send("⚠️ 今週のクエストが見つかりません。", ephemeral=True)
             return
 
-        # 完了・辞退・延長済みのクエストを除外（未着手・進行中のみ対象）
+        # 完了・辞退済みのクエストを除外（空欄・未着手・進行中が対象）
         completions = await self.bot.db.get_quest_completions(user_id, week_start)
         completed_titles = {c["quest_title"] for c in completions}
 
         pending_quests = []
         for q in user_quests:
-            if q["quest_title"] not in completed_titles and q["status"] in ["未着手", "進行中"]:
+            st = q.get("status", "").strip()
+            if q["quest_title"] not in completed_titles and st not in ["完了", "辞退"]:
                 pending_quests.append(q)
 
         if not pending_quests:
@@ -531,14 +532,15 @@ class QuestCog(commands.Cog):
                 if result:
                     extended_count += 1
                     # リーダーへ通知
-                    leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
-                    if leader:
+                    if config.LEADER_ID:
                         member = self.bot.get_user(q["discord_id"])
                         name = member.display_name if member else f"ID:{q['discord_id']}"
-                        await send_dm_safely(
-                            leader,
-                            content=f"⚠️ **自動延長**: {name} さんの『{q['quest_title']}』を今週に持ち越しました。"
+                        notify_embed = discord.Embed(
+                            title="🔄 クエスト自動延長",
+                            description=f"**{name}** さんの『{q['quest_title']}』を今週に持ち越しました。",
+                            color=config.COLOR_WARNING,
                         )
+                        await send_dm_safely(self.bot, int(config.LEADER_ID), notify_embed)
 
             if extended_count > 0:
                 logger.info(f"🔄 自動延長処理完了: {extended_count}件を今週に複製")
