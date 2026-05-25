@@ -25,6 +25,7 @@ from discord import app_commands
 
 import config
 from gamification import ExpManager, TitleSystem
+from utils.messaging import send_dm_safely
 
 logger = logging.getLogger(__name__)
 JST = timezone(timedelta(hours=9))
@@ -257,7 +258,7 @@ class SendQuestSelectView(discord.ui.View):
             from cogs.quest import QuestView
             view = QuestView(self.bot)
             
-            await target.send(embed=embed, view=view)
+            await send_dm_safely(target, embed=embed, view=view)
             
             # 送信成功したクエストの sent フラグを TRUE に一括更新
             titles = [q["quest_title"] for q in user_quests]
@@ -354,6 +355,44 @@ class AdminHubView(discord.ui.View):
         view = FixStatusUserSelectView(self.bot)
         await interaction.response.send_message("✏️ **ステータスの手動修正**\n修正したいメンバーを選択してください。", view=view, ephemeral=True)
 
+    @discord.ui.button(label="🗑️ 旧ステータス一括クリーンアップ", style=discord.ButtonStyle.danger, custom_id="admin_hub_cleanup_status", row=2)
+    async def cleanup_status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._check_admin(interaction): return
+        await interaction.response.defer(ephemeral=True)
+
+        sheets = getattr(self.bot, "sheets", None)
+        if not sheets:
+            await interaction.followup.send("⚠️ Google Sheets が未接続です。", ephemeral=True)
+            return
+
+        try:
+            week_start = sheets.get_current_week_start()
+            quests = await sheets.get_weekly_quests(week_start)
+            
+            target_status = ["未着手", "進行中", "延長"]
+            to_cleanup = [q for q in quests if q.get("status", "").strip() in target_status]
+            
+            if not to_cleanup:
+                await interaction.followup.send("✅ クリーンアップが必要なデータはありませんでした。", ephemeral=True)
+                return
+            
+            member_quests = {}
+            for q in to_cleanup:
+                uid = q["discord_id"]
+                if uid not in member_quests:
+                    member_quests[uid] = []
+                member_quests[uid].append(q["quest_title"])
+                
+            for uid, titles in member_quests.items():
+                for title in titles:
+                    await sheets.update_quest_status(week_start, uid, title, "")
+                    
+            await interaction.followup.send(f"✅ **{len(to_cleanup)}件** の旧ステータスを空欄にリセットしました。", ephemeral=True)
+            logger.info(f"🗑️ 旧ステータスクリーンアップ: {len(to_cleanup)}件リセット")
+        except Exception as e:
+            logger.error(f"❌ クリーンアップエラー: {e}")
+            await interaction.followup.send(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
+
     @discord.ui.button(label="🔁 未完了クエスト再配信", style=discord.ButtonStyle.success, custom_id="admin_hub_resend_pending", row=2)
     async def resend_pending_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         """sent=TRUE だが status が空欄のクエストを再配信する（延長分の救済用）"""
@@ -419,8 +458,9 @@ class AdminHubView(discord.ui.View):
                     embed.set_footer(text="しんちょくん 🤖 | 未完了クエスト再配信")
 
                     view = QuestView(self.bot)
-                    await user.send(embed=embed, view=view)
-                    sent_count += 1
+                    success = await send_dm_safely(user, embed=embed, view=view)
+                    if success:
+                        sent_count += 1
                 except Exception as e:
                     logger.error(f"❌ 再配信エラー ({uid}): {e}")
 
@@ -795,25 +835,17 @@ class FixStatusActionView(discord.ui.View):
         self.title = title
         self.week_start = week_start
 
-    @discord.ui.button(label="未着手", style=discord.ButtonStyle.secondary)
-    async def status_todo(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._update(interaction, "未着手")
-
-    @discord.ui.button(label="進行中", style=discord.ButtonStyle.primary)
-    async def status_doing(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._update(interaction, "進行中")
-
-    @discord.ui.button(label="完了", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="✅ 完了", style=discord.ButtonStyle.success)
     async def status_done(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._update(interaction, "完了")
 
-    @discord.ui.button(label="延長", style=discord.ButtonStyle.secondary)
-    async def status_extend(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._update(interaction, "延長")
-
-    @discord.ui.button(label="辞退", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="⏸️ 辞退", style=discord.ButtonStyle.danger)
     async def status_decline(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._update(interaction, "辞退")
+
+    @discord.ui.button(label="🔄 リセット（空欄に戻す）", style=discord.ButtonStyle.secondary)
+    async def status_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "")
 
     async def _update(self, interaction: discord.Interaction, status: str):
         await interaction.response.defer(ephemeral=True)
