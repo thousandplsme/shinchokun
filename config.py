@@ -32,6 +32,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 PROGRESS_CHANNEL_ID = int(os.getenv("PROGRESS_CHANNEL_ID", "0"))
 SOS_CHANNEL_ID = int(os.getenv("SOS_CHANNEL_ID", "0"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
 
 # ============================================

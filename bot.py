@@ -122,6 +122,13 @@ class ShinchokuBot(commands.Bot):
             self.add_view(ScheduleVoteView(self, poll["id"], candidates))
         logger.info(f"✅ 進行中の投票View復元: {len(active_polls)}件")
 
+        # 7. Botログチャンネル
+        if config.LOG_CHANNEL_ID:
+            from utils.discord_log_handler import DiscordLogHandler
+            handler = DiscordLogHandler(self, config.LOG_CHANNEL_ID)
+            logging.getLogger().addHandler(handler)  # ルートロガーに追加
+            logger.info("✅ Botログチャンネル連携開始")
+
         # 5. スラッシュコマンド同期
         if config.GUILD_ID:
             guild = discord.Object(id=config.GUILD_ID)
