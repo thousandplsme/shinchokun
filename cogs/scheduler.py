@@ -4,7 +4,7 @@ cogs/scheduler.py — 日程調整「調整さん」方式（v2.2 新規）
 全体向けの日程調整投票機能。
 1. リーダーが議題＋候補日時を入力
 2. 全メンバーにDMで投票フォームが届く（チェックボックス式）
-3. 48時間 or 全員回答で自動集計
+3. 24時間 or 全員回答で自動集計
 4. リーダーDMに集計結果 + 確定ボタン
 5. 確定 → Discordサーバーイベント自動作成 + 全員にDM通知
 
@@ -22,6 +22,7 @@ cogs/scheduler.py — 日程調整「調整さん」方式（v2.2 新規）
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -34,7 +35,39 @@ from utils.messaging import send_dm_safely
 logger = logging.getLogger(__name__)
 JST = timezone(timedelta(hours=9))
 
-POLL_EXPIRE_HOURS = 36
+POLL_EXPIRE_HOURS = 24
+
+def _parse_japanese_datetime(text: str) -> datetime | None:
+    """候補日時テキストから datetime を抽出する（ベストエフォート）"""
+    now = datetime.now(JST)
+
+    # パターン1: M/D（曜）H:MM or M/D H:MM
+    m = re.search(r'(\d{1,2})/(\d{1,2}).*?(\d{1,2}):(\d{2})', text)
+    if m:
+        month, day, hour, minute = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        year = now.year
+        try:
+            dt = datetime(year, month, day, hour, minute, tzinfo=JST)
+            if dt < now:
+                dt = dt.replace(year=year + 1)
+            return dt
+        except ValueError:
+            pass
+
+    # パターン2: M月D日 H:MM
+    m = re.search(r'(\d{1,2})月(\d{1,2})日.*?(\d{1,2}):(\d{2})', text)
+    if m:
+        month, day, hour, minute = int(m[1]), int(m[2]), int(m[3]), int(m[4])
+        year = now.year
+        try:
+            dt = datetime(year, month, day, hour, minute, tzinfo=JST)
+            if dt < now:
+                dt = dt.replace(year=year + 1)
+            return dt
+        except ValueError:
+            pass
+
+    return None
 
 
 # ============================================
@@ -214,7 +247,8 @@ class ScheduleConfirmView(discord.ui.View):
         guild = self.bot.get_guild(config.GUILD_ID) if config.GUILD_ID else None
         if guild:
             try:
-                start_time = datetime.now(JST) + timedelta(days=1)
+                parsed_time = _parse_japanese_datetime(slot)
+                start_time = parsed_time if parsed_time else datetime.now(JST) + timedelta(days=1)
                 event = await guild.create_scheduled_event(
                     name=f"📅 {poll['subject']}",
                     description=f"日程調整で確定: {slot}\n議題: {poll['subject']}",
@@ -281,6 +315,23 @@ async def _tally_and_notify(bot: commands.Bot, poll_id: int):
     ranked = sorted(tally.items(), key=lambda x: x[1], reverse=True)
     ranked_with_total = [(slot, count, total) for slot, count in ranked]
 
+    voter_ids = {vote["discord_id"] for vote in votes}
+    all_member_ids = set(config.get_active_member_ids())
+    all_member_ids.discard(poll["created_by"])  # 作成者自身は投票対象外
+    non_voter_ids = all_member_ids - voter_ids
+
+    async def _resolve_name(uid):
+        u = bot.get_user(uid)
+        if not u:
+            try:
+                u = await bot.fetch_user(uid)
+            except:
+                return f"ID:{uid}"
+        return u.display_name
+
+    voter_names = [await _resolve_name(vid) for vid in voter_ids]
+    non_voter_names = [await _resolve_name(nid) for nid in non_voter_ids]
+
     # 作成者にDMで結果を送信
     if creator := await bot.fetch_user(poll["created_by"]):
         embed = discord.Embed(
@@ -295,6 +346,16 @@ async def _tally_and_notify(bot: commands.Bot, poll_id: int):
             result_lines.append(f"**{slot}** [{bar}] {count}/{t}{star}")
         embed.add_field(
             name="📅 結果", value="\n".join(result_lines) or "回答なし", inline=False,
+        )
+        embed.add_field(
+            name="✅ 回答済み",
+            value=", ".join(sorted(voter_names)) or "なし",
+            inline=True,
+        )
+        embed.add_field(
+            name="⏳ 未回答",
+            value=", ".join(sorted(non_voter_names)) or "全員回答済み 🎉",
+            inline=True,
         )
         embed.add_field(
             name="💡 操作", value="下のボタンで日時を確定してください。", inline=False,

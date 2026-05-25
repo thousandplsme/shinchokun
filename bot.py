@@ -113,6 +113,15 @@ class ShinchokuBot(commands.Bot):
         self.add_view(AdminHubView(self))
         logger.info("✅ 永続View登録完了")
 
+        # 進行中の日程調整投票のViewを復元
+        import json
+        from cogs.scheduler import ScheduleVoteView
+        active_polls = await self.db.get_active_open_polls()
+        for poll in active_polls:
+            candidates = json.loads(poll["candidates"])
+            self.add_view(ScheduleVoteView(self, poll["id"], candidates))
+        logger.info(f"✅ 進行中の投票View復元: {len(active_polls)}件")
+
         # 5. スラッシュコマンド同期
         if config.GUILD_ID:
             guild = discord.Object(id=config.GUILD_ID)

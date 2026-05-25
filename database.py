@@ -737,6 +737,15 @@ class Database:
             (now,),
         )
 
+    async def get_active_open_polls(self) -> list[dict]:
+        """status='open' かつ有効期限内の投票を取得する（永続View復元用）"""
+        now = now_jst().isoformat()
+        return await self._fetch_all(
+            """SELECT * FROM schedule_polls
+               WHERE status = 'open' AND expires_at > ?""",
+            (now,),
+        )
+
     # ============================================
     # タスク申請操作（v2.2 新規）
     # ============================================
