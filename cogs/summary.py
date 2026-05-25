@@ -220,6 +220,8 @@ class SummaryCog(commands.Cog):
         土曜 09:00 にスケジューラから呼ばれる。
         今週のクエストで「完了」が1件もないメンバーにDMで声掛けする。
         """
+        return  # [Task 10] 通知過多を避けるため一時凍結
+        
         sheets = getattr(self.bot, "sheets", None)
         if not sheets:
             logger.warning("⚠️ 土曜リマインダー: Google Sheets 未接続のためスキップ")
@@ -285,38 +287,29 @@ class SummaryCog(commands.Cog):
 # 日曜用 未完タスク確認UI
 # ============================================
 
-class QuestExtendModal(discord.ui.Modal, title="▶️ クエストを来週に延長する"):
+class QuestExtendAllModal(discord.ui.Modal, title="▶️ 全てのクエストを来週に延長"):
     reason = discord.ui.TextInput(
         label="延長の理由",
         placeholder="例: 他のタスクが重なり、来週に持ち越したいです。",
         style=discord.TextStyle.paragraph, required=True, max_length=500,
     )
 
-    def __init__(self, bot: commands.Bot, quest_title: str, week_start: str):
+    def __init__(self, bot: commands.Bot, quests: list[dict], week_start: str):
         super().__init__()
         self.bot = bot
-        self.quest_title = quest_title
+        self.quests = quests
         self.week_start = week_start
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
         # 延長 = ステータスを空欄のまま残す（月曜の自動処理で今週に複製される）
-        # リーダーへ通知のみ行う
-        if leader := self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None:
-            embed = discord.Embed(
-                title="▶️ クエスト延長の通知",
-                description=f"**{interaction.user.display_name}** さんがクエストの延長を希望しました。",
-                color=discord.Color.orange()
-            )
-            embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
-            embed.add_field(name="理由", value=self.reason.value, inline=False)
-            embed.set_thumbnail(url=interaction.user.display_avatar.url)
-            await send_dm_safely(leader, embed=embed)
+        # 通知はリーダーのDMではなくログチャンネルへ出力する
+        titles_str = "\n".join(f"・{q['quest_title']}" for q in self.quests)
+        logger.info(f"▶️ クエスト延長: {interaction.user.display_name} が以下のクエストを延長しました。\n{titles_str}\n理由: {self.reason.value}")
 
         await interaction.followup.send(
-            "✅ リーダーに延長の意向を通知しました。\n"
-            "月曜日にクエストが自動的に来週へ持ち越されます。",
+            "✅ 延長の意向を記録しました。\n月曜日にクエストが自動的に来週へ持ち越されます。",
             ephemeral=True
         )
 
@@ -328,81 +321,78 @@ class SummaryQuestDeclineModal(discord.ui.Modal, title="⏸️ クエストを�
         style=discord.TextStyle.paragraph, required=True, max_length=500,
     )
 
-    def __init__(self, bot: commands.Bot, quest_title: str, week_start: str):
+    def __init__(self, bot: commands.Bot, quest_titles: list[str], week_start: str):
         super().__init__()
         self.bot = bot
-        self.quest_title = quest_title
+        self.quest_titles = quest_titles
         self.week_start = week_start
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
         try:
-            await self.bot.sheets.update_quest_status(
-                self.week_start, interaction.user.id, self.quest_title, "辞退"
-            )
+            for title in self.quest_titles:
+                await self.bot.sheets.update_quest_status(
+                    self.week_start, interaction.user.id, title, "辞退"
+                )
         except Exception as e:
             logger.error(f"❌ 辞退ステータス更新エラー: {e}")
             await interaction.followup.send("⚠️ スプレッドシートの更新に失敗しました。", ephemeral=True)
             return
 
-        # リーダーへの通知（try-except の外に配置）
-        if leader := self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None:
-            embed = discord.Embed(
-                title="⏸️ クエスト辞退の通知",
-                description=f"**{interaction.user.display_name}** さんがクエストを辞退しました。",
-                color=discord.Color.red()
-            )
-            embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
-            embed.add_field(name="理由", value=self.reason.value, inline=False)
-            embed.set_thumbnail(url=interaction.user.display_avatar.url)
-            await send_dm_safely(leader, embed=embed)
+        titles_str = "\n".join(f"・{t}" for t in self.quest_titles)
+        logger.info(f"⏸️ クエスト辞退: {interaction.user.display_name} が以下のクエストを辞退しました。\n{titles_str}\n理由: {self.reason.value}")
 
-        await interaction.followup.send("✅ クエストを辞退し、リーダーに通知しました。", ephemeral=True)
+        await interaction.followup.send(f"✅ {len(self.quest_titles)}件のクエストを辞退しました。", ephemeral=True)
 
 
 class UnfinishedQuestDMView(discord.ui.View):
     def __init__(self, bot: commands.Bot, quests: list[dict], week_start: str):
         super().__init__(timeout=None)
         self.bot = bot
+        self.quests = quests
         self.week_start = week_start
-        self.selected_quest_title = None
+        self.selected_quest_titles = []
 
         options = [
             discord.SelectOption(label=q["quest_title"][:100], value=q["quest_title"])
             for q in quests
         ]
         
-        # Select Menu
-        select = discord.ui.Select(placeholder="対応する未完クエストを選択...", options=options, custom_id="unfin_quest_select")
+        # Select Menu with multiple selection
+        select = discord.ui.Select(
+            placeholder="辞退するクエストを選択（複数可）...", 
+            options=options, 
+            custom_id="unfin_quest_select",
+            min_values=1,
+            max_values=len(options)
+        )
         select.callback = self.select_callback
         self.add_item(select)
 
-        # Buttons (Disabled initially)
-        self.extend_btn = discord.ui.Button(label="▶️ 来週に延長する", style=discord.ButtonStyle.primary, disabled=True, custom_id="unfin_extend_btn")
+        # Extend ALL Button (always enabled)
+        self.extend_btn = discord.ui.Button(label="▶️ 全て来週に延長", style=discord.ButtonStyle.primary, custom_id="unfin_extend_btn")
         self.extend_btn.callback = self.extend_callback
         self.add_item(self.extend_btn)
 
-        self.decline_btn = discord.ui.Button(label="⏸️ 辞退する", style=discord.ButtonStyle.danger, disabled=True, custom_id="unfin_decline_btn")
+        # Decline Button (Disabled initially)
+        self.decline_btn = discord.ui.Button(label="⏸️ 選択したクエストを辞退", style=discord.ButtonStyle.danger, disabled=True, custom_id="unfin_decline_btn")
         self.decline_btn.callback = self.decline_callback
         self.add_item(self.decline_btn)
 
     async def select_callback(self, interaction: discord.Interaction):
-        self.selected_quest_title = interaction.data["values"][0]
-        self.extend_btn.disabled = False
+        self.selected_quest_titles = interaction.data["values"]
         self.decline_btn.disabled = False
         await interaction.response.edit_message(view=self)
 
     async def extend_callback(self, interaction: discord.Interaction):
-        if not self.selected_quest_title:
-            return
-        modal = QuestExtendModal(self.bot, self.selected_quest_title, self.week_start)
+        modal = QuestExtendAllModal(self.bot, self.quests, self.week_start)
         await interaction.response.send_modal(modal)
 
     async def decline_callback(self, interaction: discord.Interaction):
-        if not self.selected_quest_title:
+        if not self.selected_quest_titles:
             return
-        modal = SummaryQuestDeclineModal(self.bot, self.selected_quest_title, self.week_start)
+        modal = SummaryQuestDeclineModal(self.bot, self.selected_quest_titles, self.week_start)
         await interaction.response.send_modal(modal)
 
 async def setup(bot: commands.Bot):

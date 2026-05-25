@@ -376,22 +376,9 @@ class QuestDeclineModal(discord.ui.Modal, title="⏸️ クエストを辞退す
             await interaction.followup.send("⚠️ スプレッドシートの更新に失敗しました。", ephemeral=True)
             return
 
-        leader = self.bot.get_user(int(config.LEADER_ID)) if config.LEADER_ID else None
-        if leader:
-            embed = discord.Embed(
-                title="⏸️ クエスト辞退の通知",
-                description=f"**{interaction.user.display_name}** さんがクエストを辞退しました。",
-                color=discord.Color.red()
-            )
-            embed.add_field(name="クエスト名", value=self.quest_title, inline=False)
-            embed.add_field(name="理由", value=self.reason.value, inline=False)
-            embed.set_thumbnail(url=interaction.user.display_avatar.url)
-            try:
-                await leader.send(embed=embed)
-            except Exception:
-                pass
+        logger.info(f"⏸️ クエスト辞退: {interaction.user.display_name} がクエストを辞退しました。\n・{self.quest_title}\n理由: {self.reason.value}")
 
-        await interaction.followup.send("✅ クエストを辞退し、リーダーに通知しました。", ephemeral=True)
+        await interaction.followup.send("✅ クエストを辞退しました。", ephemeral=True)
 
 
 class QuestQuestionSelectView(discord.ui.View):
@@ -531,16 +518,10 @@ class QuestCog(commands.Cog):
                 )
                 if result:
                     extended_count += 1
-                    # リーダーへ通知
-                    if config.LEADER_ID:
-                        member = self.bot.get_user(q["discord_id"])
-                        name = member.display_name if member else f"ID:{q['discord_id']}"
-                        notify_embed = discord.Embed(
-                            title="🔄 クエスト自動延長",
-                            description=f"**{name}** さんの『{q['quest_title']}』を今週に持ち越しました。",
-                            color=config.COLOR_WARNING,
-                        )
-                        await send_dm_safely(self.bot, int(config.LEADER_ID), notify_embed)
+                    # リーダーへはDMではなくログチャンネルへ通知
+                    member = self.bot.get_user(q["discord_id"])
+                    name = member.display_name if member else f"ID:{q['discord_id']}"
+                    logger.info(f"🔄 クエスト自動延長: {name} さんの『{q['quest_title']}』を今週に持ち越しました。")
 
             if extended_count > 0:
                 logger.info(f"🔄 自動延長処理完了: {extended_count}件を今週に複製")
