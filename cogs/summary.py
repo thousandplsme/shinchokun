@@ -287,32 +287,6 @@ class SummaryCog(commands.Cog):
 # 日曜用 未完タスク確認UI
 # ============================================
 
-class QuestExtendAllModal(discord.ui.Modal, title="▶️ 全てのクエストを来週に延長"):
-    reason = discord.ui.TextInput(
-        label="延長の理由",
-        placeholder="例: 他のタスクが重なり、来週に持ち越したいです。",
-        style=discord.TextStyle.paragraph, required=True, max_length=500,
-    )
-
-    def __init__(self, bot: commands.Bot, quests: list[dict], week_start: str):
-        super().__init__()
-        self.bot = bot
-        self.quests = quests
-        self.week_start = week_start
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        # 延長 = ステータスを空欄のまま残す（月曜の自動処理で今週に複製される）
-        # 通知はリーダーのDMではなくログチャンネルへ出力する
-        titles_str = "\n".join(f"・{q['quest_title']}" for q in self.quests)
-        logger.info(f"▶️ クエスト延長: {interaction.user.display_name} が以下のクエストを延長しました。\n{titles_str}\n理由: {self.reason.value}")
-
-        await interaction.followup.send(
-            "✅ 延長の意向を記録しました。\n月曜日にクエストが自動的に来週へ持ち越されます。",
-            ephemeral=True
-        )
-
 
 class SummaryQuestDeclineModal(discord.ui.Modal, title="⏸️ クエストを辞退する"):
     reason = discord.ui.TextInput(
@@ -386,8 +360,14 @@ class UnfinishedQuestDMView(discord.ui.View):
         await interaction.response.edit_message(view=self)
 
     async def extend_callback(self, interaction: discord.Interaction):
-        modal = QuestExtendAllModal(self.bot, self.quests, self.week_start)
-        await interaction.response.send_modal(modal)
+        await interaction.response.defer(ephemeral=True)
+        titles_str = "\n".join(f"・{q['quest_title']}" for q in self.quests)
+        logger.info(f"▶️ クエスト延長: {interaction.user.display_name} が以下のクエストを延長しました。\n{titles_str}")
+
+        await interaction.followup.send(
+            "✅ 延長の意向を記録しました。\n月曜日にクエストが自動的に来週へ持ち越されます。",
+            ephemeral=True
+        )
 
     async def decline_callback(self, interaction: discord.Interaction):
         if not self.selected_quest_titles:
