@@ -262,6 +262,12 @@ class SheetsClient:
                 except (ValueError, TypeError):
                     r["exp_reward"] = 10
                     
+                # 延長回数の読み取り（空欄や文字列の場合は0）
+                try:
+                    r["extend_count"] = int(r.get("延長回数", r.get("extension_count", 0)))
+                except (ValueError, TypeError):
+                    r["extend_count"] = 0
+                    
                 # sent列（TRUE/FALSE）の読み取り
                 sent_val = str(r.get("sent", "FALSE")).strip().upper()
                 r["sent"] = (sent_val == "TRUE")
@@ -433,8 +439,9 @@ class SheetsClient:
                 
             worksheet = self._spreadsheet.worksheet("週次タスク")
             # sent列（8列目）は空欄（FALSE相当）になるように追加
+            # 延長回数（9列目）は初期値 0 として追加
             worksheet.append_row(
-                [week_start, member_name, str(discord_id), quest_title, quest_detail, exp_reward, status, "FALSE"],
+                [week_start, member_name, str(discord_id), quest_title, quest_detail, exp_reward, status, "FALSE", 0],
                 value_input_option="USER_ENTERED",
             )
 
@@ -489,9 +496,16 @@ class SheetsClient:
             exp = int(target_row.get("exp_reward", 10))
             member_name = target_row.get("member_name", "")
             
-            # 新しい行を追加（ステータスは空欄、sent=FALSE）
+            # 延長回数を取得し、+1 する
+            try:
+                current_extend_count = int(target_row.get("延長回数", target_row.get("extension_count", 0)))
+            except (ValueError, TypeError):
+                current_extend_count = 0
+            new_extend_count = current_extend_count + 1
+            
+            # 新しい行を追加（ステータスは空欄、sent=FALSE、延長回数を書き込み）
             worksheet.append_row(
-                [new_week_start, member_name, str(discord_id), quest_title, detail, exp, "", "FALSE"],
+                [new_week_start, member_name, str(discord_id), quest_title, detail, exp, "", "FALSE", new_extend_count],
                 value_input_option="USER_ENTERED",
             )
             return True
