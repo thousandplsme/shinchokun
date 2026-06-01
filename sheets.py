@@ -306,10 +306,15 @@ class SheetsClient:
             # 該当する行をすべて特定
             found_count = 0
             for i, r in enumerate(records):
+                try:
+                    r_discord_id = int(r.get("discord_id", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
                 row_num = i + 2
                 if (
                     str(r.get("week_start", "")).strip() == week_start
-                    and int(r.get("discord_id", 0)) == discord_id
+                    and r_discord_id == discord_id
                     and r.get("quest_title", "") in quest_titles
                 ):
                     worksheet.update_cell(row_num, sent_col, val)
@@ -333,10 +338,15 @@ class SheetsClient:
             col_idx = headers.index(field_name) + 1
 
             for i, r in enumerate(records):
+                try:
+                    r_discord_id = int(r.get("discord_id", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
                 row_num = i + 2
                 if (
                     str(r.get("week_start", "")).strip() == week_start
-                    and int(r.get("discord_id", 0)) == discord_id
+                    and r_discord_id == discord_id
                     and r.get("quest_title", "") == quest_title
                 ):
                     worksheet.update_cell(row_num, col_idx, new_value)
@@ -416,10 +426,15 @@ class SheetsClient:
         「週次タスク」シートに1行追加する。
         """
         def _append():
+            member = self.get_member(discord_id)
+            member_name = ""
+            if member:
+                member_name = member.get("member_name", member.get("name", member.get("名前", "")))
+                
             worksheet = self._spreadsheet.worksheet("週次タスク")
-            # sent列（7列目）は空欄（FALSE相当）になるように追加
+            # sent列（8列目）は空欄（FALSE相当）になるように追加
             worksheet.append_row(
-                [week_start, str(discord_id), quest_title, quest_detail, exp_reward, status, "FALSE"],
+                [week_start, member_name, str(discord_id), quest_title, quest_detail, exp_reward, status, "FALSE"],
                 value_input_option="USER_ENTERED",
             )
 
@@ -438,9 +453,14 @@ class SheetsClient:
 
             # 重複チェック: 既に今週に同じクエストが存在するか
             for r in records:
+                try:
+                    r_discord_id = int(r.get("discord_id", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
                 if (
                     str(r.get("week_start", "")).strip() == new_week_start
-                    and int(r.get("discord_id", 0)) == discord_id
+                    and r_discord_id == discord_id
                     and r.get("quest_title", "") == quest_title
                 ):
                     return None  # 既に存在 → スキップ
@@ -448,9 +468,14 @@ class SheetsClient:
             # コピー元を検索
             target_row = None
             for r in records:
+                try:
+                    r_discord_id = int(r.get("discord_id", 0))
+                except (ValueError, TypeError):
+                    continue
+                    
                 if (
                     str(r.get("week_start", "")).strip() == week_start
-                    and int(r.get("discord_id", 0)) == discord_id
+                    and r_discord_id == discord_id
                     and r.get("quest_title", "") == quest_title
                 ):
                     target_row = r
@@ -462,10 +487,11 @@ class SheetsClient:
             # detail と exp_reward をコピー
             detail = str(target_row.get("quest_detail", ""))
             exp = int(target_row.get("exp_reward", 10))
+            member_name = target_row.get("member_name", "")
             
             # 新しい行を追加（ステータスは空欄、sent=FALSE）
             worksheet.append_row(
-                [new_week_start, str(discord_id), quest_title, detail, exp, "", "FALSE"],
+                [new_week_start, member_name, str(discord_id), quest_title, detail, exp, "", "FALSE"],
                 value_input_option="USER_ENTERED",
             )
             return True
