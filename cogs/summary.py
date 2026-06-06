@@ -33,6 +33,7 @@ import config
 from database import now_jst
 from sheets import SheetsClient
 from utils.messaging import send_dm_safely
+from cogs.quest import QuestView
 
 logger = logging.getLogger(__name__)
 
@@ -198,13 +199,12 @@ class SummaryCog(commands.Cog):
 
         for uid, p_quests in pending_map.items():
             if user := self.bot.get_user(uid):
-                view = UnfinishedQuestDMView(self.bot, p_quests, week_start)
+                view = ForgetCompleteConfirmView(self.bot, p_quests, week_start)
                 embed = discord.Embed(
                     title="⚠️ 未完了クエストの確認",
                     description=(
-                        "今週のクエストで未完了のものが残っています。\n"
-                        "月曜 09:00 までに下のメニューから「辞退」を選択してください。\n"
-                        "※回答がない場合、自動的に来週へ持ち越されます。"
+                        "今週のクエストで完了済みのものはありますか？\n"
+                        "（完了報告の押し忘れ確認）"
                     ),
                     color=discord.Color.orange()
                 )
@@ -318,6 +318,86 @@ class SummaryQuestDeclineModal(discord.ui.Modal, title="⏸️ クエストを�
         logger.info(f"⏸️ クエスト辞退: {interaction.user.display_name} が以下のクエストを辞退しました。\n{titles_str}\n理由: {self.reason.value}")
 
         await interaction.followup.send(f"✅ {len(self.quest_titles)}件のクエストを辞退しました。", ephemeral=True)
+
+
+class MultiQuestCompleteView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, quests: list[dict], week_start: str):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.quests = {q["quest_title"]: q for q in quests}
+        self.week_start = week_start
+        self.selected_titles = []
+
+        options = [
+            discord.SelectOption(label=title[:100], value=title)
+            for title in self.quests.keys()
+        ]
+        
+        select = discord.ui.Select(
+            placeholder="完了したクエストを選択（複数可）...",
+            options=options,
+            min_values=1,
+            max_values=len(options),
+            custom_id="multi_complete_select"
+        )
+        select.callback = self.select_callback
+        self.add_item(select)
+
+        self.submit_btn = discord.ui.Button(label="✅ 選択項目を完了にする", style=discord.ButtonStyle.success, disabled=True, custom_id="multi_complete_btn")
+        self.submit_btn.callback = self.submit_callback
+        self.add_item(self.submit_btn)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        self.selected_titles = interaction.data["values"]
+        self.submit_btn.disabled = False
+        await interaction.response.edit_message(view=self)
+
+    async def submit_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        quest_view = QuestView(self.bot)
+        for title in self.selected_titles:
+            quest = self.quests.get(title)
+            if quest:
+                await quest_view._complete_quest(interaction, quest, self.week_start)
+        
+        # ボタンを無効化
+        self.submit_btn.disabled = True
+        self.submit_btn.label = "✅ 処理完了"
+        try:
+            await interaction.followup.edit_message(interaction.message.id, view=self)
+        except Exception:
+            pass
+
+class ForgetCompleteConfirmView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, quests: list[dict], week_start: str):
+        super().__init__(timeout=None)
+        self.bot = bot
+        self.quests = quests
+        self.week_start = week_start
+
+    @discord.ui.button(label="はい（完了済みのものがある）", style=discord.ButtonStyle.success, custom_id="forget_confirm_yes")
+    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = MultiQuestCompleteView(self.bot, self.quests, self.week_start)
+        embed = discord.Embed(
+            title="✅ クエスト完了報告",
+            description="完了したクエストを選択してください。",
+            color=discord.Color.green()
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="いいえ（すべて未完了）", style=discord.ButtonStyle.secondary, custom_id="forget_confirm_no")
+    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = UnfinishedQuestDMView(self.bot, self.quests, self.week_start)
+        embed = discord.Embed(
+            title="⚠️ 未完了クエストの対応",
+            description=(
+                "今週のクエストで未完了のものが残っています。\n"
+                "月曜 09:00 までに下のメニューから対応を選択してください。\n"
+                "※回答がない場合、自動的に来週へ持ち越されます。"
+            ),
+            color=discord.Color.orange()
+        )
+        await interaction.response.edit_message(embed=embed, view=view)
 
 
 class UnfinishedQuestDMView(discord.ui.View):
